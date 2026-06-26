@@ -541,21 +541,6 @@ int r3d_engine_render_frame(r3d_engine_handle handle, float elapsed)
     ctx->be->vt->end_frame(ctx->be);
     if (trace) R3D_TRACE("  [6] end_frame done");
 
-    /* 诊断：前 3 帧读回 back buffer 中心像素，判定 GPU 是否真把三角形写进了
-     * framebuffer。中心(233,233)在三角形覆盖区内：
-     *   = 0xbababa 附近(三角形浅灰) → GPU 画对了，问题在显示/pan/cache；
-     *   = 0x261f1f(背景深色)        → clear 生效但 draw 没落到这块缓冲；
-     *   = 其它                       → 地址/格式错乱。 */
-    if (trace) {
-        const uint8_t *fb = (const uint8_t *)ctx->rt[back].pixels;
-        uint32_t cx = ctx->fb_w / 2, cy = ctx->fb_h / 2;
-        const uint32_t *px = (const uint32_t *)(fb + (size_t)cy * ctx->fb_stride + cx * 4);
-        const uint32_t *p0 = (const uint32_t *)fb;  /* 左上角(应是背景或三角外) */
-        R3D_TRACE("  [6b] readback back=%d pixels=%p center(%u,%u)=0x%08lx topleft=0x%08lx",
-                  back, (void *)fb, (unsigned)cx, (unsigned)cy,
-                  (unsigned long)*px, (unsigned long)*p0);
-    }
-
     /* 翻页上屏 */
     if (ctx->double_buffer) {
         ctx->pinfo.yoffset = (back == 0) ? 0 : ctx->mem2_yoffset;

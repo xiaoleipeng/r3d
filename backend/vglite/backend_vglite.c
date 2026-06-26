@@ -31,17 +31,19 @@
 #include <math.h>
 #include <time.h>
 
-/* 流程日志：真机定位 GPU hang 在哪个 vg_lite 调用。
+/* 日志：仅用于错误与每秒一次的性能统计。
  * 用 syslog；本机(softsim)无 syslog 时退化为 printf。 */
 #if defined(__NuttX__) || defined(CONFIG_ARCH)
 #include <syslog.h>
-#define VGL_TRACE(fmt, ...) syslog(LOG_INFO, "r3d_vgl: " fmt "\n", ##__VA_ARGS__)
+#define VGL_LOG(fmt, ...) syslog(LOG_INFO,  "r3d_vgl: " fmt "\n", ##__VA_ARGS__)
+#define VGL_ERR(fmt, ...) syslog(LOG_ERR,   "r3d_vgl: " fmt "\n", ##__VA_ARGS__)
 #else
 #include <stdio.h>
-#define VGL_TRACE(fmt, ...) fprintf(stderr, "r3d_vgl: " fmt "\n", ##__VA_ARGS__)
+#define VGL_LOG(fmt, ...) fprintf(stderr, "r3d_vgl: " fmt "\n", ##__VA_ARGS__)
+#define VGL_ERR(fmt, ...) fprintf(stderr, "r3d_vgl: " fmt "\n", ##__VA_ARGS__)
 #endif
 
-/* 返回当前单调毫秒，用于给 vg_lite 调用计时 */
+/* 返回当前单调毫秒，用于每秒统计窗口计时 */
 static long vgl_now_ms(void)
 {
     struct timespec ts;
@@ -120,8 +122,23 @@ typedef struct {
     /* 纹理表(句柄=指针) */
     /* 直接用 vgl_tex_t* 作句柄，无需表 */
 
-    uint32_t draw_calls;
-    uint32_t frame_no;     /* 帧计数，用于限制 trace 日志量 */
+    /* ---- 每帧计数(end_frame 末尾汇总进秒窗口) ---- */
+    uint32_t draw_calls;       /* 本帧 vg_lite_draw / draw_pattern 调用次数 */
+    uint32_t tex_binds;        /* 本帧纹理绑定次数(draw_pattern) */
+    uint32_t frame_no;         /* 帧计数 */
+
+    /* ---- 每秒性能统计窗口(行业标准 3D 指标) ---- */
+    long     stat_window_ms;   /* 当前统计窗口起始时刻 */
+    uint32_t stat_frames;      /* 窗口内帧数 */
+    /* 三角面(提交绘制的三角形数) */
+    uint64_t stat_tris_sum;
+    uint32_t stat_tris_min, stat_tris_max;
+    /* draw call 次数 */
+    uint64_t stat_dc_sum;
+    uint32_t stat_dc_min, stat_dc_max;
+    /* 纹理绑定次数 */
+    uint64_t stat_tex_sum;
+    uint32_t stat_tex_min, stat_tex_max;
 } vgl_impl_t;
 
 /* ---------------- 工具 ---------------- */
@@ -145,50 +162,6 @@ static const char *vgl_err_str(vg_lite_error_t e)
         default:                          return "UNKNOWN";
     }
 }
-
-/* 打印 vg_lite 调用返回值。ret!=SUCCESS 一律打印(WARNING)；
- * SUCCESS 仅在前几帧 trace 时打印，避免稳态刷屏。 */
-#define VGL_LOG_RET(call, ret)                                            \
-    do {                                                                  \
-        vg_lite_error_t _r = (ret);                                       \
-        if (_r != VG_LITE_SUCCESS)                                        \
-            VGL_TRACE("%s ret=%d(%s)", (call), (int)_r, vgl_err_str(_r)); \
-        else if (trace)                                                   \
-            VGL_TRACE("%s ret=0(SUCCESS)", (call));                       \
-    } while (0)
-
-/* GPU 关键寄存器地址(对照 VGLiteKernel/vg_lite_hw.h)。
- * 用公开 API vg_lite_get_register 读取，不耦合驱动内部 hal。 */
-#define VGL_REG_HW_IDLE       0x004   /* 全空闲态 = 0x0B05 */
-#define VGL_REG_INTR_STATUS   0x010   /* 完成/错误中断状态 */
-#define VGL_REG_INTR_ENABLE   0x014   /* 中断使能位 */
-#define VGL_HW_IDLE_STATE     0x0B05
-
-/* 打印 GPU 状态寄存器，用于诊断 finish 超时(done 中断未到达) hang。
- * tag 标识打印时机(如 "pre-finish"/"post-finish")。 */
-static void vgl_dump_gpu_state(const char *tag)
-{
-    vg_lite_uint32_t idle = 0, istat = 0, ien = 0;
-    vg_lite_error_t e_idle = vg_lite_get_register(VGL_REG_HW_IDLE, &idle);
-    vg_lite_error_t e_stat = vg_lite_get_register(VGL_REG_INTR_STATUS, &istat);
-    vg_lite_error_t e_en   = vg_lite_get_register(VGL_REG_INTR_ENABLE, &ien);
-
-    if (e_idle != VG_LITE_SUCCESS || e_stat != VG_LITE_SUCCESS || e_en != VG_LITE_SUCCESS) {
-        VGL_TRACE("gpu_state[%s]: get_register failed (idle=%d stat=%d en=%d)",
-                  tag, (int)e_idle, (int)e_stat, (int)e_en);
-        return;
-    }
-
-    VGL_TRACE("gpu_state[%s]: IDLE=0x%08lx(%s) INTR_STATUS=0x%08lx INTR_ENABLE=0x%08lx%s",
-              tag,
-              (unsigned long)idle,
-              (idle == VGL_HW_IDLE_STATE) ? "all-idle"
-                  : (idle & 0x80000000u) ? "AXI-BUS-ERR" : "busy/partial",
-              (unsigned long)istat,
-              (unsigned long)ien,
-              (ien == 0) ? " [!! INTR NOT ENABLED]" : "");
-}
-
 
 /* r3d ARGB8888 → VGLite ABGR8888(VGLite color 内部为 0xAABBGGRR) */
 static vg_lite_color_t argb_to_vgl(uint32_t argb)
@@ -262,9 +235,10 @@ static r3d_result_t vgl_init(r3d_backend_t *self, const r3d_backend_cfg_t *cfg)
         return R3D_ERR_NO_MEM;
     }
 
-    /* 初始化后立即 dump 一次 GPU 状态：确认(gpu_init 之后)中断是否已使能。
-     * 若 INTR_ENABLE=0，则 GPU 干完活也无法通知 CPU，finish 必然超时。 */
-    vgl_dump_gpu_state("post-init");
+    /* 性能统计窗口初始化 */
+    im->stat_window_ms = vgl_now_ms();
+    im->stat_tris_min = im->stat_dc_min = im->stat_tex_min = 0xFFFFFFFFu;
+
     return R3D_OK;
 }
 
@@ -299,8 +273,8 @@ static r3d_texture_handle_t vgl_create_texture(r3d_backend_t *self, const r3d_im
 
     vg_lite_error_t ae = vg_lite_allocate(&t->buf);
     if (ae != VG_LITE_SUCCESS) {
-        VGL_TRACE("create_texture: vg_lite_allocate(%dx%d) ret=%d(%s)",
-                  (int)img->w, (int)img->h, (int)ae, vgl_err_str(ae));
+        VGL_ERR("create_texture: vg_lite_allocate(%dx%d) ret=%d(%s)",
+                (int)img->w, (int)img->h, (int)ae, vgl_err_str(ae));
         free(t);
         return R3D_TEXTURE_NONE;
     }
@@ -330,9 +304,9 @@ static void vgl_destroy_texture(r3d_backend_t *self, r3d_texture_handle_t h)
 static void vgl_begin_frame(r3d_backend_t *self, const r3d_target_t *target)
 {
     vgl_impl_t *im = (vgl_impl_t *)self->impl;
-    int trace = (im->frame_no < 3);
     im->tri_count = 0;
     im->draw_calls = 0;
+    im->tex_binds = 0;
 
     if (!target) return;
 
@@ -363,31 +337,12 @@ static void vgl_begin_frame(r3d_backend_t *self, const r3d_target_t *target)
     im->vp_w = (int)target->w;
     im->vp_h = (int)target->h;
 
-    if (im->frame_no < 3) {
-        VGL_TRACE("begin_frame #%u: TARGET buffer fields:", (unsigned)im->frame_no);
-        VGL_TRACE("  .width=%d .height=%d .stride=%d",
-                  (int)im->target.width, (int)im->target.height, (int)im->target.stride);
-        VGL_TRACE("  .format=%d .tiled=%d", (int)im->target.format, (int)im->target.tiled);
-        VGL_TRACE("  .memory=%p .address=0x%lx .handle=%p",
-                  im->target.memory, (unsigned long)im->target.address, im->target.handle);
-        VGL_TRACE("  src pixels=%p phys_addr=0x%lx (address uses %s)",
-                  target->pixels, (unsigned long)target->phys_addr,
-                  target->phys_addr ? "phys_addr" : "virt(pixels)");
-        VGL_TRACE("  .image_mode=%d .transparency=%d .compress_mode=%d .fc_enable=%d .premultiplied=%d",
-                  (int)im->target.image_mode, (int)im->target.transparency,
-                  (int)im->target.compress_mode, (int)im->target.fc_enable,
-                  (int)im->target.premultiplied);
-        VGL_TRACE("  valid=%d vp=%dx%d", im->target_valid, im->vp_w, im->vp_h);
-    }
-
     /* 清屏(深色背景)。clear 命令与后续 draw 同批，帧末 end_frame 统一 finish。 */
     if (im->target_valid) {
         vg_lite_color_t bg = argb_to_vgl(0xFF1F1F26u);
-        if (im->frame_no < 3)
-            VGL_TRACE("  vg_lite_clear(target=%p rect=NULL(full) color=0x%08lx)",
-                      (void *)&im->target, (unsigned long)bg);
         vg_lite_error_t e = vg_lite_clear(&im->target, NULL, bg);
-        VGL_LOG_RET("  vg_lite_clear", e);
+        if (e != VG_LITE_SUCCESS)
+            VGL_ERR("vg_lite_clear ret=%d(%s)", (int)e, vgl_err_str(e));
     }
 }
 
@@ -397,26 +352,6 @@ static void vgl_set_camera(r3d_backend_t *self, const r3d_camera_t *cam)
     im->view = cam->view;
     im->proj = cam->proj;
     r3d_mat4_mul(&im->view_proj, &im->proj, &im->view);  /* VP = P * V */
-
-    /* 诊断：前 3 帧 dump 三个矩阵(各 16 float)。set_camera 在 end_frame
-     * frame_no++ 之前执行，故 gate 用 im->frame_no < 3。 */
-    if (im->frame_no < 3) {
-        VGL_TRACE("set_camera #%u: view (col-major 16f):", (unsigned)im->frame_no);
-        VGL_TRACE("  [%.4f %.4f %.4f %.4f]", im->view.m[0], im->view.m[4], im->view.m[8],  im->view.m[12]);
-        VGL_TRACE("  [%.4f %.4f %.4f %.4f]", im->view.m[1], im->view.m[5], im->view.m[9],  im->view.m[13]);
-        VGL_TRACE("  [%.4f %.4f %.4f %.4f]", im->view.m[2], im->view.m[6], im->view.m[10], im->view.m[14]);
-        VGL_TRACE("  [%.4f %.4f %.4f %.4f]", im->view.m[3], im->view.m[7], im->view.m[11], im->view.m[15]);
-        VGL_TRACE("set_camera #%u: proj (col-major 16f):", (unsigned)im->frame_no);
-        VGL_TRACE("  [%.4f %.4f %.4f %.4f]", im->proj.m[0], im->proj.m[4], im->proj.m[8],  im->proj.m[12]);
-        VGL_TRACE("  [%.4f %.4f %.4f %.4f]", im->proj.m[1], im->proj.m[5], im->proj.m[9],  im->proj.m[13]);
-        VGL_TRACE("  [%.4f %.4f %.4f %.4f]", im->proj.m[2], im->proj.m[6], im->proj.m[10], im->proj.m[14]);
-        VGL_TRACE("  [%.4f %.4f %.4f %.4f]", im->proj.m[3], im->proj.m[7], im->proj.m[11], im->proj.m[15]);
-        VGL_TRACE("set_camera #%u: view_proj (col-major 16f):", (unsigned)im->frame_no);
-        VGL_TRACE("  [%.4f %.4f %.4f %.4f]", im->view_proj.m[0], im->view_proj.m[4], im->view_proj.m[8],  im->view_proj.m[12]);
-        VGL_TRACE("  [%.4f %.4f %.4f %.4f]", im->view_proj.m[1], im->view_proj.m[5], im->view_proj.m[9],  im->view_proj.m[13]);
-        VGL_TRACE("  [%.4f %.4f %.4f %.4f]", im->view_proj.m[2], im->view_proj.m[6], im->view_proj.m[10], im->view_proj.m[14]);
-        VGL_TRACE("  [%.4f %.4f %.4f %.4f]", im->view_proj.m[3], im->view_proj.m[7], im->view_proj.m[11], im->view_proj.m[15]);
-    }
 }
 
 /* ---------------- 绘制(收集三角形) ---------------- */
@@ -439,14 +374,7 @@ static void vgl_draw(r3d_backend_t *self, const r3d_mesh_t *mesh,
                                   : (vgl_tex_t *)mat->base_color;
     uint32_t base_argb = mat->base_color_factor ? mat->base_color_factor : 0xFFFFFFFFu;
 
-    /* 诊断计数(frame0 末尾汇总)：collected=进入队列, skip_* 为各丢弃原因 */
-    int frame0 = (im->frame_no == 0);
-    uint32_t dbg_logged = 0;          /* 已打印数据的三角形个数(限前 5) */
-    uint32_t cnt_total = 0, cnt_collected = 0;
-    uint32_t cnt_behind = 0, cnt_bad = 0, cnt_backface = 0, cnt_degenerate = 0, cnt_capped = 0;
-
     for (uint32_t i = 0; i + 2 < mesh->index_count; i += 3) {
-        cnt_total++;
         const r3d_vertex_t *v0 = &mesh->vertices[mesh->indices[i]];
         const r3d_vertex_t *v1 = &mesh->vertices[mesh->indices[i+1]];
         const r3d_vertex_t *v2 = &mesh->vertices[mesh->indices[i+2]];
@@ -459,7 +387,7 @@ static void vgl_draw(r3d_backend_t *self, const r3d_mesh_t *mesh,
             c[k] = mul_mv(&mvp, vv[k]->pos.x, vv[k]->pos.y, vv[k]->pos.z, 1.0f);
             if (c[k].w <= VGL_W_EPSILON) behind = 1;
         }
-        if (behind) { cnt_behind++; continue; }  /* 简化：整三角形任一顶点在近平面前/相机后则丢弃。
+        if (behind) { continue; }  /* 简化：整三角形任一顶点在近平面前/相机后则丢弃。
                                 * 注：无近平面裁剪，靠较保守的 w 阈值 + 屏幕坐标
                                 * 范围检查共同防止超大坐标喂给 GPU tessellation。 */
         /* view 空间线性深度(用于画家算法排序，比 NDC z 更稳健) */
@@ -485,16 +413,15 @@ static void vgl_draw(r3d_backend_t *self, const r3d_mesh_t *mesh,
                 break;
             }
         }
-        if (bad) { cnt_bad++; continue; }
+        if (bad) { continue; }
 
         /* 背面剔除(屏幕空间有向面积)；双面材质跳过 */
         float area = (sx[1]-sx[0])*(sy[2]-sy[0]) - (sx[2]-sx[0])*(sy[1]-sy[0]);
-        if (!double_sided && area >= 0.0f) { cnt_backface++; continue; } /* 顺时针为正面(Y已翻转) */
-        if (fabsf(area) < 0.01f) { cnt_degenerate++; continue; }          /* 退化三角形 */
+        if (!double_sided && area >= 0.0f) { continue; } /* 顺时针为正面(Y已翻转) */
+        if (fabsf(area) < 0.01f) { continue; }            /* 退化三角形 */
 
-        if (im->tri_count >= im->tri_cap) { cnt_capped++; break; }
+        if (im->tri_count >= im->tri_cap) { break; }
         vgl_tri_t *T = &im->tris[im->tri_count++];
-        cnt_collected++;
 
         for (int k = 0; k < 3; k++) {
             T->sx[k] = sx[k];
@@ -548,30 +475,6 @@ static void vgl_draw(r3d_backend_t *self, const r3d_mesh_t *mesh,
         T->color = argb_to_vgl(draw_argb);
         T->translucent = translucent;
         T->blend = mat->blend;
-
-        /* 诊断：frame0 打印前 5 个被收集三角形的数据(将被转成 path 的源数据)。 */
-        if (frame0 && dbg_logged < 5) {
-            VGL_TRACE("draw collect tri[%u]: screen pts (%.3f,%.3f) (%.3f,%.3f) (%.3f,%.3f)",
-                      (unsigned)dbg_logged,
-                      T->sx[0], T->sy[0], T->sx[1], T->sy[1], T->sx[2], T->sy[2]);
-            VGL_TRACE("  uv (%.4f,%.4f) (%.4f,%.4f) (%.4f,%.4f) depth=%.4f",
-                      T->uv[0][0], T->uv[0][1], T->uv[1][0], T->uv[1][1],
-                      T->uv[2][0], T->uv[2][1], T->depth);
-            VGL_TRACE("  color=0x%08lx tex=%p translucent=%d blend=%d",
-                      (unsigned long)T->color, (void *)T->tex,
-                      T->translucent, T->blend);
-            dbg_logged++;
-        }
-    }
-
-    /* 诊断：frame0 汇总收集/丢弃统计，定位"喂给 GPU 的三角形总量"。 */
-    if (frame0) {
-        VGL_TRACE("draw summary frame0: total=%u collected=%u (queue now %u/%u) | "
-                  "skip behind=%u bad=%u backface=%u degenerate=%u capped=%u",
-                  (unsigned)cnt_total, (unsigned)cnt_collected,
-                  (unsigned)im->tri_count, (unsigned)im->tri_cap,
-                  (unsigned)cnt_behind, (unsigned)cnt_bad, (unsigned)cnt_backface,
-                  (unsigned)cnt_degenerate, (unsigned)cnt_capped);
     }
 }
 
@@ -643,42 +546,68 @@ static vg_lite_blend_t to_vgl_blend(int blend, int translucent)
     }
 }
 
+/* 每秒一次输出标准 3D 性能统计：FPS + 三角面/draw call/纹理绑定的
+ * 平均、最小、最大。把本帧计数并入窗口，跨过 1 秒边界时汇总并重置。 */
+static void vgl_stats_tick(vgl_impl_t *im, uint32_t tris, uint32_t dc, uint32_t tex)
+{
+    im->stat_frames++;
+    im->stat_tris_sum += tris;
+    im->stat_dc_sum   += dc;
+    im->stat_tex_sum  += tex;
+    if (tris < im->stat_tris_min) im->stat_tris_min = tris;
+    if (tris > im->stat_tris_max) im->stat_tris_max = tris;
+    if (dc   < im->stat_dc_min)   im->stat_dc_min   = dc;
+    if (dc   > im->stat_dc_max)   im->stat_dc_max   = dc;
+    if (tex  < im->stat_tex_min)  im->stat_tex_min  = tex;
+    if (tex  > im->stat_tex_max)  im->stat_tex_max  = tex;
+
+    long now = vgl_now_ms();
+    long dt  = now - im->stat_window_ms;
+    if (dt < 1000 || im->stat_frames == 0) return;
+
+    float fps = im->stat_frames * 1000.0f / (float)dt;
+    VGL_LOG("perf: fps=%.1f frames=%u | tri/f avg=%u min=%u max=%u | "
+            "drawcall/f avg=%u min=%u max=%u | tex/f avg=%u min=%u max=%u",
+            fps, (unsigned)im->stat_frames,
+            (unsigned)(im->stat_tris_sum / im->stat_frames),
+            (unsigned)im->stat_tris_min, (unsigned)im->stat_tris_max,
+            (unsigned)(im->stat_dc_sum / im->stat_frames),
+            (unsigned)im->stat_dc_min, (unsigned)im->stat_dc_max,
+            (unsigned)(im->stat_tex_sum / im->stat_frames),
+            (unsigned)im->stat_tex_min, (unsigned)im->stat_tex_max);
+
+    /* 重置窗口 */
+    im->stat_window_ms = now;
+    im->stat_frames = 0;
+    im->stat_tris_sum = im->stat_dc_sum = im->stat_tex_sum = 0;
+    im->stat_tris_min = im->stat_dc_min = im->stat_tex_min = 0xFFFFFFFFu;
+    im->stat_tris_max = im->stat_dc_max = im->stat_tex_max = 0;
+}
+
 static void vgl_end_frame(r3d_backend_t *self)
 {
     vgl_impl_t *im = (vgl_impl_t *)self->impl;
-    int trace = (im->frame_no < 3);
-    /* 诊断：前几帧无条件详细日志(每个三角形)，定位 finish 超时由哪个 vg_lite
-     * 调用/数据触发。frame0 对每个三角形都打印；为防刷屏，frame0 仅前 8 个 +
-     * 之后每 32 个打印一次。 */
-    int frame0 = (im->frame_no == 0);
+    uint32_t submit_tris = im->tri_count;  /* 本帧提交绘制的三角面数 */
 
     if (!im->target_valid || im->tri_count == 0) {
-        if (trace) VGL_TRACE("end_frame #%u: nothing to draw (valid=%d tris=%u)",
-                             (unsigned)im->frame_no, im->target_valid,
-                             (unsigned)im->tri_count);
         /* 即使没有三角形，begin_frame 里的 vg_lite_clear 命令仍在命令缓冲中，
-         * 必须 finish 让其落地，否则随后翻页会显示一块未清屏(残影/花屏)的缓冲。
-         * 仅 target 有效时才有待落地的 clear。 */
+         * 必须 finish 让其落地，否则随后翻页会显示一块未清屏的缓冲。 */
         if (im->target_valid) {
             vg_lite_error_t fe = vg_lite_finish();
-            VGL_LOG_RET("end_frame(empty) vg_lite_finish", fe);
+            if (fe != VG_LITE_SUCCESS)
+                VGL_ERR("end_frame(empty) vg_lite_finish ret=%d(%s)",
+                        (int)fe, vgl_err_str(fe));
         }
+        vgl_stats_tick(im, 0, 0, 0);
         im->frame_no++;
         return;
     }
-
-    if (trace) VGL_TRACE("end_frame #%u: %u tris, sort + draw...",
-                         (unsigned)im->frame_no, (unsigned)im->tri_count);
 
     /* 画家算法排序 */
     qsort(im->tris, im->tri_count, sizeof(vgl_tri_t), tri_cmp);
 
     for (uint32_t i = 0; i < im->tri_count; i++) {
         vgl_tri_t *T = &im->tris[i];
-
-        /* 诊断：frame0 对每个三角形打印；为防刷屏，仅前 8 个 + 之后每 32 个。
-         * 仍保留原 trace(前 3 帧)对 tri[0] 的打印行为，二者取并。 */
-        int log_tri = frame0 && (i < 8 || (i % 32) == 0);
 
         vg_lite_path_t *pp = (i < im->vgpaths_cap) ? &im->vgpaths[i] : NULL;
         if (!pp) break;
@@ -688,15 +617,11 @@ static void vgl_end_frame(r3d_backend_t *self)
          * GPU 直到 finish 才读取，故数据必须存活整帧。
          *
          * 关键(对照 rive VGLitePath::appendOpCode / appendFloat)：
-         * 即便 path 格式是 VG_LITE_FP32，GPU 命令解析器(FE)对每个 4 字节 slot
-         * 的解释是——opcode slot 按【uint32 整数位模式】读，坐标 slot 按【IEEE754
-         * float】读。rive 正是这样：opcode 用 (uint32_t)2 写(字节 02 00 00 00)，
-         * 坐标用 float 写。
-         * 之前 r3d 误把 opcode 写成 (float)2.0f(位模式 0x40000000)，FE 读到非法
-         * opcode 流，在浮点坐标下触发 tessellation 握手卡死(整数坐标偶然避开死区，
-         * 故 roundf 能跑但不是真正修复)。现改为与 rive 完全一致：opcode=uint32。
-         *
-         * 坐标保持浮点(VG_LITE_FP32 本就支持，rive 也用浮点坐标)。 */
+         * 即便 path 格式是 VG_LITE_FP32，path 缓冲里每个 4 字节 slot 的解释为——
+         * opcode slot 按【uint32 整数位模式】写(如 MOVE = 字节 02 00 00 00)，
+         * 坐标 slot 按【IEEE754 float】写。
+         * 若误把 opcode 写成 (float)2.0f(位模式 0x40000000)，GPU 命令解析器会
+         * 读到非法 opcode 流，触发 tessellation 握手卡死(finish 超时)。 */
         float *pdata = &im->path_data[(size_t)i * 11];
         uint32_t *pop = (uint32_t *)pdata;  /* 同一缓冲的 uint32 视图，用于写 opcode */
         pop[0] = (uint32_t)VLC_OP_MOVE;  pdata[1] = T->sx[0]; pdata[2] = T->sy[0];
@@ -733,120 +658,45 @@ static void vgl_end_frame(r3d_backend_t *self)
 
         vg_lite_blend_t blend = to_vgl_blend(T->blend, T->translucent);
 
-        if ((trace && i == 0) || log_tri) {
-            VGL_TRACE("  tri[%u] init_path: fmt=FP32(%d) quality=%d len=%d pdata=%p bbox=[%.1f,%.1f,%.1f,%.1f]",
-                      (unsigned)i, (int)VG_LITE_FP32, (int)VGL_FILL_QUALITY,
-                      (int)(11 * sizeof(uint32_t)), (void *)pdata,
-                      minx, miny, maxx, maxy);
-            VGL_TRACE("  tri[%u] pdata: MOVE(%.3f,%.3f) LINE(%.3f,%.3f) LINE(%.3f,%.3f) CLOSE(op=%u) END(op=%u)",
-                      (unsigned)i, pdata[1], pdata[2], pdata[4], pdata[5],
-                      pdata[7], pdata[8], (unsigned)pop[9], (unsigned)pop[10]);
-            VGL_TRACE("  tri[%u] bbox minx=%.3f miny=%.3f maxx=%.3f maxy=%.3f",
-                      (unsigned)i, minx, miny, maxx, maxy);
-            VGL_TRACE("  tri[%u] path.format=%d .quality=%d .path_length=%d .path=%p .path_changed=%d .path_type=%d",
-                      (unsigned)i, (int)pp->format, (int)pp->quality, (int)pp->path_length,
-                      pp->path, (int)pp->path_changed, (int)pp->path_type);
-            VGL_TRACE("  tri[%u] path_mat (3x3 row-major):", (unsigned)i);
-            VGL_TRACE("    [%.4f %.4f %.4f]", path_mat.m[0][0], path_mat.m[0][1], path_mat.m[0][2]);
-            VGL_TRACE("    [%.4f %.4f %.4f]", path_mat.m[1][0], path_mat.m[1][1], path_mat.m[1][2]);
-            VGL_TRACE("    [%.4f %.4f %.4f]", path_mat.m[2][0], path_mat.m[2][1], path_mat.m[2][2]);
-            VGL_TRACE("  tri[%u] blend=%d fill=EVEN_ODD(%d) color=0x%08lx tex=%p",
-                      (unsigned)i, (int)blend, (int)VGL_FILL_RULE,
-                      (unsigned long)T->color, (void *)T->tex);
-        }
-
-        vg_lite_error_t derr = VG_LITE_SUCCESS;
+        vg_lite_error_t derr;
         if (T->tex) {
             vg_lite_matrix_t pat_mat;
             if (solve_affine(T, T->tex->width, T->tex->height, &pat_mat)) {
-                if ((trace && i == 0) || log_tri) {
-                    VGL_TRACE("  tri[%u] tex w=%d h=%d pat_mat (3x3 row-major):",
-                              (unsigned)i, (int)T->tex->width, (int)T->tex->height);
-                    VGL_TRACE("    [%.4f %.4f %.4f]", pat_mat.m[0][0], pat_mat.m[0][1], pat_mat.m[0][2]);
-                    VGL_TRACE("    [%.4f %.4f %.4f]", pat_mat.m[1][0], pat_mat.m[1][1], pat_mat.m[1][2]);
-                    VGL_TRACE("    [%.4f %.4f %.4f]", pat_mat.m[2][0], pat_mat.m[2][1], pat_mat.m[2][2]);
-                    VGL_TRACE("  tri[%u] CALL vg_lite_draw_pattern(tgt=%p path=%p fill=NON_ZERO(%d) mat=%p tex=%p patmat=%p blend=%d pad=PAD(%d) color=0x%08lx filter=BILINEAR)",
-                              (unsigned)i, (void *)&im->target, (void *)pp, (int)VG_LITE_FILL_NON_ZERO,
-                              (void *)&path_mat, (void *)T->tex, (void *)&pat_mat,
-                              (int)blend, (int)VG_LITE_PATTERN_PAD,
-                              (unsigned long)T->color);
-                }
                 derr = vg_lite_draw_pattern(&im->target, pp, VGL_FILL_RULE,
                                      &path_mat, T->tex, &pat_mat,
                                      blend, VG_LITE_PATTERN_PAD,
                                      0, T->color, VG_LITE_FILTER_BI_LINEAR);
+                im->tex_binds++;
             } else {
-                if ((trace && i == 0) || log_tri)
-                    VGL_TRACE("  tri[%u] solve_affine failed -> fallback CALL vg_lite_draw(tgt=%p path=%p fill=NON_ZERO(%d) mat=%p blend=%d color=0x%08lx)",
-                              (unsigned)i, (void *)&im->target, (void *)pp, (int)VG_LITE_FILL_NON_ZERO,
-                              (void *)&path_mat, (int)blend, (unsigned long)T->color);
                 derr = vg_lite_draw(&im->target, pp, VGL_FILL_RULE,
                              &path_mat, blend, T->color);
             }
         } else {
-            /* 纯色三角形 */
-            if ((trace && i == 0) || log_tri)
-                VGL_TRACE("  tri[%u] CALL vg_lite_draw(tgt=%p path=%p fill=NON_ZERO(%d) mat=%p blend=%d color=0x%08lx)",
-                          (unsigned)i, (void *)&im->target, (void *)pp, (int)VG_LITE_FILL_NON_ZERO,
-                          (void *)&path_mat, (int)blend, (unsigned long)T->color);
             derr = vg_lite_draw(&im->target, pp, VGL_FILL_RULE,
                          &path_mat, blend, T->color);
         }
-        /* draw 失败(命令缓冲/资源异常)：继续提交后续 draw 只会把错误放大，
-         * 中止本帧的绘制循环，走到末尾 finish 把已入队命令安全落地。 */
-        VGL_LOG_RET(T->tex ? "  vg_lite_draw_pattern" : "  vg_lite_draw", derr);
-        if (log_tri)
-            VGL_TRACE("  tri[%u] %s ret=%d(%s)", (unsigned)i,
-                      T->tex ? "vg_lite_draw_pattern" : "vg_lite_draw",
-                      (int)derr, vgl_err_str(derr));
         if (derr != VG_LITE_SUCCESS) {
-            VGL_TRACE("  tri[%u] draw failed ret=%d(%s), abort frame draw loop",
-                      (unsigned)i, (int)derr, vgl_err_str(derr));
+            /* draw 失败：中止本帧绘制循环，走到末尾 finish 把已入队命令落地。 */
+            VGL_ERR("tri[%u] %s ret=%d(%s), abort frame", (unsigned)i,
+                    T->tex ? "vg_lite_draw_pattern" : "vg_lite_draw",
+                    (int)derr, vgl_err_str(derr));
             break;
         }
-        /* path 描述符存活在 im->vgpaths[i]，uploaded GPU 内存帧末统一释放。 */
         im->draw_calls++;
 
-        /* 每个 draw 之后 flush —— 对齐 rive flushIfNeeded(FLUSH_MAX_COUNT=0 时
-         * 每个 draw 都无条件 flush)。
-         *
-         * 关键(对照 rive 已验证序列)：rive 的 endFrame 之所以 finish 3ms 正常返回，
-         * 是因为它在每个 drawPath 后 vg_lite_flush 把命令缓冲正式提交、开新缓冲，
-         * 到 finish 时 GPU 正在跑(pre-finish 抓到 IDLE=0x7ffffefa busy)，
-         * finish arm 等待 → 完成中断到达 → 返回。
-         *
-         * r3d 旧实现用 (draw_calls & 31)==0 做周期 flush：单三角形 draw_calls=1，
-         * 1&31=1≠0，flush 从不触发，命令缓冲未经 flush 提交就直接 finish。
-         * 现象正是 pre-finish 时 GPU 已空闲(IDLE=0x7fffffff)、FE 卡在 TS↔PE
-         * semaphore 握手、完成中断不触发、finish 超时 1.6s。
-         * 故改为与 rive 一致：每个 draw 后 flush(异步提交，不阻塞)。 */
-        long t0 = vgl_now_ms();
+        /* 每个 draw 后 flush —— 对齐 rive flushIfNeeded：把命令缓冲正式提交、
+         * 开新缓冲，使帧末 finish 能正确 arm 等待完成中断(否则 finish 超时)。 */
         vg_lite_error_t fe = vg_lite_flush();
-        long t1 = vgl_now_ms();
-        VGL_LOG_RET("  per-draw vg_lite_flush", fe);
-        if (trace) VGL_TRACE("  flush at draw %u took %ld ms", (unsigned)i, t1 - t0);
+        if (fe != VG_LITE_SUCCESS)
+            VGL_ERR("vg_lite_flush ret=%d(%s)", (int)fe, vgl_err_str(fe));
     }
 
-    if (trace) VGL_TRACE("end_frame #%u: final vg_lite_finish...", (unsigned)im->frame_no);
-    /* 诊断：finish 前汇总本帧三角形/draw 调用数并 dump GPU 状态(前 3 帧无条件)。 */
-    if (im->frame_no < 3) {
-        VGL_TRACE("end_frame #%u: pre-finish tri_count=%u draw_calls=%u",
-                  (unsigned)im->frame_no, (unsigned)im->tri_count, (unsigned)im->draw_calls);
-        vgl_dump_gpu_state("pre-finish");
-    }
-    long tf0 = vgl_now_ms();
     vg_lite_error_t fe = vg_lite_finish();
-    long tf1 = vgl_now_ms();
-    VGL_LOG_RET("end_frame vg_lite_finish", fe);
-    /* finish 失败(超时/IO)：dump GPU 状态以区分"中断未使能"vs"中断未被接住"。
-     * 成功时仅前几帧 dump。finish 耗时异常(>500ms,接近 1.5s 看门狗)也 dump。 */
-    if (fe != VG_LITE_SUCCESS || im->frame_no < 3 || (tf1 - tf0) > 500)
-        vgl_dump_gpu_state("post-finish");
-    if (trace) VGL_TRACE("end_frame #%u: done (draw_calls=%u, finish took %ld ms)",
-                         (unsigned)im->frame_no, (unsigned)im->draw_calls, tf1 - tf0);
+    if (fe != VG_LITE_SUCCESS)
+        VGL_ERR("end_frame vg_lite_finish ret=%d(%s)", (int)fe, vgl_err_str(fe));
 
-    /* path 数据写在常驻 im->path_data，未做 GPU upload，无需逐三角形释放；
-     * 下一帧直接覆写复用，缓冲在 vgl_destroy 统一释放。 */
+    /* path 数据写在常驻 im->path_data，下一帧直接覆写复用，destroy 时统一释放。 */
+    vgl_stats_tick(im, submit_tris, im->draw_calls, im->tex_binds);
     im->frame_no++;
 }
 
@@ -856,7 +706,7 @@ static void vgl_present(r3d_backend_t *self)
     /* 宿主模式：目标即宿主缓冲，flush 已在 end_frame 完成。 */
     vg_lite_error_t fe = vg_lite_finish();
     if (fe != VG_LITE_SUCCESS)
-        VGL_TRACE("present vg_lite_finish ret=%d(%s)", (int)fe, vgl_err_str(fe));
+        VGL_ERR("present vg_lite_finish ret=%d(%s)", (int)fe, vgl_err_str(fe));
 }
 
 static bool vgl_query_feature(r3d_backend_t *self, r3d_feature_t f)
