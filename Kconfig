@@ -1,0 +1,78 @@
+#
+# Copyright (C) 2025 Xiaomi Corporation
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+
+menuconfig R3D
+	bool "r3d: lightweight VGLite-based 3D engine"
+	depends on ANIMATION_ENGINE
+	default n
+	---help---
+		Enable the r3d 3D engine (B3DM/glTF rendering on the VGLite GPU).
+		Shares the VGLite GPU with LVGL via the common gpu_port.
+
+if R3D
+
+choice
+	prompt "r3d render backend"
+	default R3D_BACKEND_VGLITE
+	---help---
+		Select the render backend compiled into r3d on this target.
+
+	config R3D_BACKEND_VGLITE
+		bool "VGLite (GPU)"
+		---help---
+			Render via the shared VGLite GPU (production target).
+
+	config R3D_BACKEND_NULL
+		bool "Null (no display, for bring-up/CI)"
+endchoice
+
+config R3D_FOR_VGLITE_FB_DEV
+	string "Framebuffer device for r3d"
+	default "/dev/fb0"
+	---help---
+		Default framebuffer device opened by r3d_engine_init().
+
+config R3D_VGLITE_DEMO
+	bool "Build r3d_vglite_demo builtin app"
+	default y
+	---help---
+		Build the standalone framebuffer demo (r3d_vglite_demo).
+
+config R3D_VGLITE_DEMO_DEFAULT_FPS
+	int "r3d demo default frame rate"
+	depends on R3D_VGLITE_DEMO
+	default 60
+	range 1 120
+
+config R3D_VGLITE_DEMO_PRIORITY
+	int "r3d demo task priority"
+	depends on R3D_VGLITE_DEMO
+	default 100
+
+config R3D_VGLITE_DEMO_STACKSIZE
+	int "r3d demo task stack size"
+	depends on R3D_VGLITE_DEMO
+	default 32768
+
+config R3D_LOG_LEVEL
+	int "r3d log level"
+	default 3
+	---help---
+		3 - ERROR  4 - WARNING  6 - INFO  7 - DEBUG  255 - OFF
+		(aligned with ANIM_LOG_LEVEL)
+
+endif # R3D
