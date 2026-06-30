@@ -63,7 +63,7 @@ add_test(NAME test_m1 COMMAND test_m1)
 
 add_executable(test_m2 tests/test_m2.c)
 target_link_libraries(test_m2 PRIVATE r3d)
-add_test(NAME test_m2 COMMAND test_m2 ${CMAKE_SOURCE_DIR}/tests/assets/tri.b3dm)
+add_test(NAME test_m2 COMMAND test_m2 ${CMAKE_SOURCE_DIR}/tests/assets/tri_1.b3dm)
 
 # ---- demo（仅 OpenGL 后端）----
 if(R3D_BACKEND_OPENGL)

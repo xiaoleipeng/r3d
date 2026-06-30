@@ -72,7 +72,7 @@ int main(int argc, char **argv){
         if((sm->mat_flags & R3D_MAT_DYNAMIC_NODE) && animated)
             r3d_anim_node_matrix(m,&ast,sm->node_id,&smodel);
         for(uint32_t ii=0; ii<sm->index_count; ii++){
-            uint16_t vi = m->indices[sm->index_offset+ii];
+            uint32_t vi = r3d_index_at(m->indices, m->index_size, sm->index_offset+ii);
             if(vi>=m->vertex_count) continue;
             r3d_vec3_t p = bverts[vi].pos;
             r3d_vec4_t in={p.x,p.y,p.z,1.0f};
@@ -175,7 +175,8 @@ int main(int argc, char **argv){
             if(tl!=pass) continue;
             r3d_mesh_t mesh={0};
             mesh.vertices=verts; mesh.vertex_count=m->vertex_count;
-            mesh.indices=m->indices+sm->index_offset; mesh.index_count=sm->index_count;
+            mesh.indices=(const uint8_t*)m->indices+(size_t)sm->index_offset*m->index_size;
+            mesh.index_count=sm->index_count; mesh.index_size=m->index_size;
             mesh.dynamic = (has_skin||has_morph)?1:0;  /* 变形顶点每帧重传 */
             r3d_material_t mat={0};
             mat.base_color=sm->base_color; mat.matcap=sm->matcap;

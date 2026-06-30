@@ -149,6 +149,14 @@ static int g2b_write(g2b_scene_t *sc, const opts_t *o) {
     }
 
     buf_t vtx={0}, idx={0};
+    /* VTXCOLOR：若任一 prim 带 vcolor，则输出逐顶点色段(与 vtx 同顺序) */
+    int has_vcolor=0;
+    for(uint32_t i=0;i<sc->prim_count;i++) if(sc->prims[i].vcolor){ has_vcolor=1; break; }
+    buf_t vcol={0};
+    /* 预先统计合并后总顶点数，决定索引位宽(>65535 用 32 位，否则 16 位) */
+    uint32_t total_vcount=0;
+    for(uint32_t i=0;i<sc->prim_count;i++) total_vcount += sc->prims[i].vcount;
+    int idx32 = (total_vcount > 65535u);
     /* submesh 记录 */
     typedef struct { int tex,blend,flags; uint32_t ioff,icount,bcf; int nid; } sm_t;
     sm_t *sms=(sm_t*)calloc(sc->prim_count,sizeof(sm_t)); uint32_t sm_n=0;
@@ -177,11 +185,19 @@ static int g2b_write(g2b_scene_t *sc, const opts_t *o) {
             oct_encode(wp->verts[i].nx,wp->verts[i].ny,wp->verts[i].nz,&qv.normal_oct[0],&qv.normal_oct[1]);
             { int ao=(int)(wp->verts[i].ao*255.0f+0.5f); if(ao>255)ao=255; if(ao<0)ao=0; qv.pad[0]=(uint8_t)ao; }
             buf_put(&vtx,&qv,sizeof qv);
+            if(has_vcolor){
+                /* ARGB → BGRA 字节序写出(与纹理像素/framebuffer 同序) */
+                uint32_t c = wp->vcolor ? wp->vcolor[i] : 0xFFFFFFFFu;
+                uint8_t bgra[4]={ (uint8_t)(c&0xFF), (uint8_t)((c>>8)&0xFF),
+                                  (uint8_t)((c>>16)&0xFF), (uint8_t)((c>>24)&0xFF) };
+                buf_put(&vcol,bgra,4);
+            }
         }
-        /* 索引(加 vbase 偏移) */
+        /* 索引(加 vbase 偏移)：16 或 32 位 */
         for(uint32_t i=0;i<wp->icount;i++){
-            uint16_t v=(uint16_t)(wp->idx[i]+vbase);
-            buf_put(&idx,&v,sizeof v);
+            uint32_t gv = wp->idx[i]+vbase;
+            if(idx32){ buf_put(&idx,&gv,sizeof(uint32_t)); }
+            else { uint16_t v=(uint16_t)gv; buf_put(&idx,&v,sizeof(uint16_t)); }
         }
         sms[sm_n].tex=wp->tex_id; sms[sm_n].blend=wp->blend;
         sms[sm_n].flags=wp->mat_flags | (wp->is_dynamic? 16:0); /* bit4=dynamic */
@@ -192,8 +208,8 @@ static int g2b_write(g2b_scene_t *sc, const opts_t *o) {
     free(order);
     uint32_t total_v = vbase, total_i = ioff;
 
-    /* 索引段补齐到偶数个 u16 */
-    if ((total_i & 1)) { uint16_t z=0; buf_put(&idx,&z,sizeof z); }
+    /* 索引段补齐：16 位需补到偶数个(段 16 对齐由组装阶段保证)；32 位无需 */
+    if (!idx32 && (total_i & 1)) { uint16_t z=0; buf_put(&idx,&z,sizeof z); }
 
     /* ---- 3. submesh 段 ---- */
     buf_t smbuf={0};
@@ -247,7 +263,7 @@ static int g2b_write(g2b_scene_t *sc, const opts_t *o) {
     uint32_t skv_len=0;  uint8_t *skv_blob=g2b_build_skinvtx(sc,&skv_len);
 
     /* 段描述表 */
-    struct { uint32_t type; const void* data; uint32_t len, count; } segs[10]; int ns=0;
+    struct { uint32_t type; const void* data; uint32_t len, count; } segs[12]; int ns=0;
     segs[ns++]=(typeof(segs[0])){R3D_SEC_VERTEX, vtx.p, vtx.len, total_v};
     segs[ns++]=(typeof(segs[0])){R3D_SEC_INDEX,  idx.p, idx.len, total_i};
     if(sm_n)        segs[ns++]=(typeof(segs[0])){R3D_SEC_SUBMESH, smbuf.p, smbuf.len, sm_n};
@@ -261,17 +277,18 @@ static int g2b_write(g2b_scene_t *sc, const opts_t *o) {
     if(node_len)    segs[ns++]=(typeof(segs[0])){R3D_SEC_NODE, node_blob, node_len, sc->node_count};
     if(skel_len)    segs[ns++]=(typeof(segs[0])){R3D_SEC_SKELETON, skel_blob, skel_len, sc->joint_count};
     if(skv_len)     segs[ns++]=(typeof(segs[0])){R3D_SEC_SKINVTX, skv_blob, skv_len, total_v};
+    if(has_vcolor && vcol.len) segs[ns++]=(typeof(segs[0])){R3D_SEC_VTXCOLOR, vcol.p, vcol.len, total_v};
 
     uint32_t off_tbl=sizeof(r3d_b3dm_header_t);
     uint32_t cursor=align16(off_tbl + ns*sizeof(r3d_b3dm_section_t));
-    uint32_t seg_off[10];
+    uint32_t seg_off[12];
     for(int i=0;i<ns;i++){ seg_off[i]=cursor; cursor=align16(cursor+segs[i].len); }
     uint32_t total=cursor;
 
     uint8_t *out=(uint8_t*)calloc(1,total);
     r3d_b3dm_header_t *h=(r3d_b3dm_header_t*)out;
     h->magic=R3D_B3DM_MAGIC; h->version=R3D_B3DM_VERSION;
-    h->flags=(anim_len?R3D_B3DM_FLAG_ANIM:0)|(morph_len?R3D_B3DM_FLAG_MORPH:0)|(skv_len?R3D_B3DM_FLAG_SKIN:0);
+    h->flags=(anim_len?R3D_B3DM_FLAG_ANIM:0)|(morph_len?R3D_B3DM_FLAG_MORPH:0)|(skv_len?R3D_B3DM_FLAG_SKIN:0)|((has_vcolor&&vcol.len)?R3D_B3DM_FLAG_VTXCOLOR:0)|(idx32?R3D_B3DM_FLAG_IDX32:0);
     h->section_count=ns;
     h->bounding_sphere[0]=sc->bs[0];h->bounding_sphere[1]=sc->bs[1];
     h->bounding_sphere[2]=sc->bs[2];h->bounding_sphere[3]=sc->bs[3];
@@ -289,7 +306,7 @@ static int g2b_write(g2b_scene_t *sc, const opts_t *o) {
     if(fp)fclose(fp);
 
     free(out); free(sms);
-    free(vtx.p);free(idx.p);free(smbuf.p);
+    free(vtx.p);free(idx.p);free(smbuf.p);free(vcol.p);
     return rc;
 }
 #endif

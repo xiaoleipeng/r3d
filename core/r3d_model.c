@@ -27,9 +27,11 @@ r3d_model_t *r3d_model_load_mem(r3d_backend_t *backend, void *buf, uint32_t size
         fprintf(stderr, "[r3d] 非 B3DM 文件 (magic 不匹配)\n");
         return NULL;
     }
-    if (hdr->version != R3D_B3DM_VERSION) {
-        fprintf(stderr, "[r3d] B3DM 版本不匹配: 文件 v%u, 期望 v%u —— 请用当前 gltf2b3dm 重新转换\n",
-                hdr->version, R3D_B3DM_VERSION);
+    /* 版本兼容：接受 [MIN, 当前] 区间。v4 仅新增可选 VTXCOLOR 段，对 v3 资产
+     * 完全向后兼容(无该段即回退材质色)，不强制重转旧资产。 */
+    if (hdr->version < R3D_B3DM_VERSION_MIN || hdr->version > R3D_B3DM_VERSION) {
+        fprintf(stderr, "[r3d] B3DM 版本不支持: 文件 v%u, 支持 v%u..v%u —— 请用当前 gltf2b3dm 重新转换\n",
+                hdr->version, R3D_B3DM_VERSION_MIN, R3D_B3DM_VERSION);
         return NULL;
     }
 
@@ -79,14 +81,32 @@ r3d_model_t *r3d_model_load_mem(r3d_backend_t *backend, void *buf, uint32_t size
             m->vertices[i].normal.y = ny*inv;
             m->vertices[i].normal.z = nz*inv;
             m->vertices[i].ao = qv[i].pad[0] / 255.0f;
+            m->vertices[i].color = 0; /* 默认无顶点色，VTXCOLOR 段存在则覆盖 */
         }
     }
 
-    /* ---- INDEX ---- */
+    /* ---- VTXCOLOR（可选，去纹理材质模式烘焙的逐顶点色）---- */
+    {
+        const r3d_b3dm_section_t *svc = find_section(hdr, tbl, R3D_SEC_VTXCOLOR);
+        if (svc && svc->count == m->vertex_count) {
+            const r3d_b3dm_vtxcolor_t *vc =
+                (const r3d_b3dm_vtxcolor_t *)(base + svc->offset);
+            for (uint32_t i = 0; i < m->vertex_count; i++) {
+                /* BGRA 字节序 → ARGB u32(与 base_color_factor 同布局)，0 视为无色 */
+                uint32_t b = vc[i].bgra[0], g = vc[i].bgra[1],
+                         r = vc[i].bgra[2], a = vc[i].bgra[3];
+                uint32_t argb = (a << 24) | (r << 16) | (g << 8) | b;
+                m->vertices[i].color = argb ? argb : 0xFF000001u; /* 纯黑→近黑，避免被当无色 */
+            }
+        }
+    }
+
+    /* ---- INDEX ---- 原生位宽零拷贝(嵌入式避免额外大块分配)。IDX32 决定位宽。 */
     const r3d_b3dm_section_t *si = find_section(hdr, tbl, R3D_SEC_INDEX);
     if (!si) goto fail;
     m->index_count = si->count;
-    m->indices = (uint16_t *)(base + si->offset); /* 零拷贝指向 buf */
+    m->indices     = (const void *)(base + si->offset);
+    m->index_size  = (hdr->flags & R3D_B3DM_FLAG_IDX32) ? 4u : 2u;
 
     /* ---- SUBMESH ---- */
     const r3d_b3dm_section_t *ss = find_section(hdr, tbl, R3D_SEC_SUBMESH);
@@ -209,7 +229,7 @@ void r3d_model_free(r3d_model_t *m)
             if (m->textures[i]) m->backend->vt->destroy_texture(m->backend, m->textures[i]);
     free(m->textures);
     free(m->submeshes);
-    free(m->vertices);    /* indices 指向 raw，不单独 free */
+    free(m->vertices);    /* indices 原生零拷贝指向 raw，不单独 free */
     free(m->raw);
     free(m);
 }

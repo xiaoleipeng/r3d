@@ -13,6 +13,10 @@ const params = {
   texSize: 256,
   detailTexSize: 1024,
   variant: '',
+  materialMode: 'full',
+  morphLockRatio: 0.002,
+  morphLockMaxPct: 0.40,
+  animError: 0.01,
   autoConvert: true,
   wireframe: false,
   showNormals: false,
@@ -263,10 +267,15 @@ async function convert() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         fileId: serverFileId,
+        origName: currentFile ? currentFile.name : '',
         maxTris: params.maxTris,
         texSize: params.texSize,
         detailTexSize: params.detailTexSize,
         variant: params.variant,
+        materialMode: params.materialMode,
+        morphLockRatio: params.morphLockRatio,
+        morphLockMaxPct: params.morphLockMaxPct,
+        animError: params.animError,
       }),
     });
     const data = await resp.json();
@@ -342,7 +351,14 @@ const fConv = gui.addFolder('gltf2b3dm 选项');
 fConv.add(params, 'maxTris', 0, 200000, 1).name('减面预算 (0=不减)').onFinishChange(scheduleConvert);
 fConv.add(params, 'texSize', [64, 128, 256, 512, 1024]).name('纹理上限').onFinishChange(scheduleConvert);
 fConv.add(params, 'detailTexSize', [256, 512, 1024, 2048]).name('高细节纹理上限').onFinishChange(scheduleConvert);
+fConv.add(params, 'materialMode', ['full', 'baked-vertex', 'solid', 'none']).name('材质模式').onFinishChange(scheduleConvert);
 fConv.add(params, 'variant').name('材质变体子串').onFinishChange(scheduleConvert);
+
+const fMorph = gui.addFolder('动画网格减面保护');
+fMorph.add(params, 'morphLockRatio', 0.0005, 0.08, 0.0005).name('morph 锁定阈值 (小=锁更多)').onFinishChange(scheduleConvert);
+fMorph.add(params, 'morphLockMaxPct', 0.1, 0.95, 0.05).name('锁定占比上限').onFinishChange(scheduleConvert);
+fMorph.add(params, 'animError', 0.001, 0.1, 0.001).name('动画减面误差').onFinishChange(scheduleConvert);
+fMorph.open();
 fConv.add(params, 'autoConvert').name('参数改动自动转换');
 fConv.open();
 

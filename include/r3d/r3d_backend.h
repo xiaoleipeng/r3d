@@ -44,6 +44,9 @@ typedef struct r3d_backend_vtable {
     void (*begin_frame)(r3d_backend_t *self, const r3d_target_t *target);
     void (*set_camera)(r3d_backend_t *self, const r3d_camera_t *cam);
 
+    /* 光照参数（运行时可调，NULL=恢复默认）。可选，不支持的后端置 NULL。 */
+    void (*set_lighting)(r3d_backend_t *self, const r3d_light_params_t *lp);
+
     /* 绘制一个可渲染对象（draw call）——核心调用 */
     void (*draw)(r3d_backend_t *self,
                  const r3d_mesh_t     *mesh,

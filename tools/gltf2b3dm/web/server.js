@@ -152,15 +152,21 @@ const server = http.createServer((req, res) => {
       const src = safeJoin(UP, opt.fileId || '');
       if (!src || !fs.existsSync(src)) return sendJson(res, 400, { ok: false, error: 'file not found' });
 
-      const base = path.basename(src).replace(/\.(gltf|glb)$/i, '');
-      const b3dmName = base + '.b3dm';
-      const b3dmPath = path.join(OUT, b3dmName);
+      const base = path.basename(opt.origName || path.basename(src))
+                     .replace(/\.(gltf|glb)$/i, '')
+                     .replace(/[^\w.\-]/g, '_');   // 清掉路径/特殊字符，安全文件名
+      const tmpName = '_tmp_' + crypto.randomBytes(4).toString('hex') + '.b3dm';
+      const b3dmPath = path.join(OUT, tmpName);   // 先转到临时名，拿到面数后重命名
 
       const args = [src, b3dmPath];
       if (opt.maxTris) args.push('--max-tris', String(opt.maxTris));
       if (opt.texSize) args.push('--tex-size', String(opt.texSize));
       if (opt.detailTexSize) args.push('--detail-tex-size', String(opt.detailTexSize));
       if (opt.variant) args.push('--variant', String(opt.variant));
+      if (opt.materialMode && opt.materialMode !== 'full') args.push('--material-mode', String(opt.materialMode));
+      if (opt.morphLockRatio != null) args.push('--morph-lock-ratio', String(opt.morphLockRatio));
+      if (opt.morphLockMaxPct != null) args.push('--morph-lock-max-pct', String(opt.morphLockMaxPct));
+      if (opt.animError != null) args.push('--anim-error', String(opt.animError));
 
       execFile(TOOL, args, { timeout: 120000, maxBuffer: 16 * 1024 * 1024 }, (e, stdout, stderr) => {
         const toolOutput = (stderr || '') + (stdout || '');
@@ -170,7 +176,20 @@ const server = http.createServer((req, res) => {
         let tris = null, texs = null;
         const mm = toolOutput.match(/tris=(\d+).*?texs=(\d+)/s);
         if (mm) { tris = parseInt(mm[1], 10); texs = parseInt(mm[2], 10); }
-        const sizeKB = Math.round(fs.statSync(b3dmPath).size / 1024);
+
+        // 按"原始文件名_三角面数_材质模式.b3dm"命名
+        // (面数转换后才知道，故先转临时名再重命名；full 模式也显式标注便于区分)
+        const matMode = (opt.materialMode && /^(full|baked-vertex|solid|none)$/.test(opt.materialMode))
+                        ? opt.materialMode : 'full';
+        const b3dmName = base
+                       + (tris != null ? '_' + tris : '')
+                       + '_' + matMode
+                       + '.b3dm';
+        const finalPath = path.join(OUT, b3dmName);
+        try { fs.renameSync(b3dmPath, finalPath); }
+        catch (re) { return sendJson(res, 200, { ok: false, error: '重命名失败: ' + re.message, toolOutput }); }
+
+        const sizeKB = Math.round(fs.statSync(finalPath).size / 1024);
 
         // 反解 b3dm → gltf 供预览
         if (!VERIFY) return sendJson(res, 200, { ok: true, b3dmName, tris, texs, sizeKB, toolOutput, previewId: null });
@@ -178,7 +197,7 @@ const server = http.createServer((req, res) => {
         const previewDir = path.join(PREV, previewId);
         fs.mkdirSync(previewDir, { recursive: true });
         const gltfOut = path.join(previewDir, 'scene.gltf');
-        execFile(VERIFY, [b3dmPath, gltfOut], { timeout: 120000, maxBuffer: 16 * 1024 * 1024 }, (e2, so2, se2) => {
+        execFile(VERIFY, [finalPath, gltfOut], { timeout: 120000, maxBuffer: 16 * 1024 * 1024 }, (e2, so2, se2) => {
           if (e2) return sendJson(res, 200, { ok: true, b3dmName, tris, texs, sizeKB, toolOutput, previewId: null, previewError: (se2 || e2.message) });
           sendJson(res, 200, { ok: true, b3dmName, tris, texs, sizeKB, toolOutput, previewId });
         });

@@ -110,6 +110,9 @@ typedef struct {
     r3d_mat4_t view, proj, view_proj;
     int vp_w, vp_h;
 
+    /* 光照参数(运行时可调，init 时填默认值) */
+    r3d_light_params_t light;
+
     /* 帧三角形队列 */
     vgl_tri_t *tris;
     uint32_t   tri_count, tri_cap;
@@ -220,6 +223,8 @@ static r3d_result_t vgl_init(r3d_backend_t *self, const r3d_backend_cfg_t *cfg)
     im->tris = (vgl_tri_t *)malloc(sizeof(vgl_tri_t) * cap);
     if (!im->tris) { return R3D_ERR_NO_MEM; }
     im->tri_count = 0;
+
+    r3d_light_params_default(&im->light);   /* 光照默认参数(中性外观) */
 
     /* 每三角形一个 vg_lite_path_t + 一段 11 float 的 path 数据(存活到帧末 finish) */
     im->vgpaths_cap = cap;
@@ -376,6 +381,13 @@ static void vgl_set_camera(r3d_backend_t *self, const r3d_camera_t *cam)
     r3d_mat4_mul(&im->view_proj, &im->proj, &im->view);  /* VP = P * V */
 }
 
+static void vgl_set_lighting(r3d_backend_t *self, const r3d_light_params_t *lp)
+{
+    vgl_impl_t *im = (vgl_impl_t *)self->impl;
+    if (lp) im->light = *lp;            /* 应用调用方参数 */
+    else    r3d_light_params_default(&im->light); /* NULL = 恢复默认 */
+}
+
 /* ---------------- 绘制(收集三角形) ---------------- */
 
 static void vgl_draw(r3d_backend_t *self, const r3d_mesh_t *mesh,
@@ -397,7 +409,9 @@ static void vgl_draw(r3d_backend_t *self, const r3d_mesh_t *mesh,
     uint32_t base_argb = mat->base_color_factor ? mat->base_color_factor : 0xFFFFFFFFu;
 
     for (uint32_t i = 0; i + 2 < mesh->index_count; i += 3) {
-        uint32_t i0 = mesh->indices[i], i1 = mesh->indices[i+1], i2 = mesh->indices[i+2];
+        uint32_t i0 = r3d_index_at(mesh->indices, mesh->index_size, i),
+                 i1 = r3d_index_at(mesh->indices, mesh->index_size, i+1),
+                 i2 = r3d_index_at(mesh->indices, mesh->index_size, i+2);
         /* 防御：索引越界(损坏/不匹配的模型，如 vertex_count 远小于 index 引用)
          * 会导致越界读垃圾内存当顶点坐标，进而 NaN/超大值喂给 GPU、看门狗复位。
          * 越界的三角形直接跳过。 */
@@ -488,18 +502,35 @@ static void vgl_draw(r3d_backend_t *self, const r3d_mesh_t *mesh,
             float l = sqrtf(nx*nx + ny*ny + nz*nz);
             if (l > 1e-6f) { nx /= l; ny /= l; nz /= l; }
             ao *= (1.0f/3.0f);
-            float lx=0.3f, ly=0.5f, lz=0.8f;
-            float ll = sqrtf(lx*lx+ly*ly+lz*lz); lx/=ll; ly/=ll; lz/=ll;
+            float lx=im->light.light_dir[0], ly=im->light.light_dir[1], lz=im->light.light_dir[2];
+            float ll = sqrtf(lx*lx+ly*ly+lz*lz); if(ll<1e-6f)ll=1.0f; lx/=ll; ly/=ll; lz/=ll;
             float d = nx*lx + ny*ly + nz*lz; if (d < 0) d = 0;
             float hemi = 0.5f + 0.5f*ny;
             float lit;
             if (use_matcap)
                 lit = (0.78f + 0.10f*d + 0.12f*hemi) * (0.6f + 0.4f*ao); /* 柔和：保金属亮度 */
             else
-                lit = (0.50f + 0.32f*d + 0.18f*hemi) * ao;
-            if (lit > 1.0f) lit = 1.0f;
-            uint32_t a=(base_argb>>24)&0xFF, r=(base_argb>>16)&0xFF,
-                     g=(base_argb>>8)&0xFF, b=base_argb&0xFF;
+                /* 中性漫反射: ambient + diffuse*d + hemi*hemiTerm，乘 AO，封顶防过曝。
+                   参数运行时可调(set_lighting)，对齐 glTF 在中性环境光下的观感。 */
+                lit = (im->light.ambient + im->light.diffuse*d + im->light.hemi*hemi) * ao;
+            float lit_cap = use_matcap ? 1.0f : im->light.lit_max;
+            if (lit > lit_cap) lit = lit_cap;
+            /* 无纹理时优先用逐顶点烘焙色(去纹理材质模式)，否则用材质 base_color_factor。
+               三个顶点色取平均(flat)，再乘 flat 光照。 */
+            uint32_t shade_argb = base_argb;
+            if (!tex && (v0->color | v1->color | v2->color)) {
+                uint32_t ar=0, rr=0, gr=0, br=0; int n=0;
+                const r3d_vertex_t *cvs[3] = { v0, v1, v2 };
+                for (int k = 0; k < 3; k++) {
+                    uint32_t cc = cvs[k]->color;
+                    if (!cc) continue;
+                    ar += (cc>>24)&0xFF; rr += (cc>>16)&0xFF;
+                    gr += (cc>>8)&0xFF;  br += cc&0xFF; n++;
+                }
+                if (n) shade_argb = ((ar/n)<<24)|((rr/n)<<16)|((gr/n)<<8)|(br/n);
+            }
+            uint32_t a=(shade_argb>>24)&0xFF, r=(shade_argb>>16)&0xFF,
+                     g=(shade_argb>>8)&0xFF, b=shade_argb&0xFF;
             r=(uint32_t)(r*lit); g=(uint32_t)(g*lit); b=(uint32_t)(b*lit);
             draw_argb = (a<<24)|(r<<16)|(g<<8)|b;
         }
@@ -761,6 +792,7 @@ static const r3d_backend_vtable_t VGL_VT = {
     .destroy_texture = vgl_destroy_texture,
     .begin_frame     = vgl_begin_frame,
     .set_camera      = vgl_set_camera,
+    .set_lighting    = vgl_set_lighting,
     .draw            = vgl_draw,
     .end_frame       = vgl_end_frame,
     .present         = vgl_present,

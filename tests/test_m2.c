@@ -22,7 +22,7 @@ int main(int argc, char **argv) {
         CHECK(m->vertex_count == 3, "vertex_count == 3");
         CHECK(m->index_count == 3, "index_count == 3");
         CHECK(m->submesh_count == 1, "submesh_count == 1");
-        CHECK(m->indices[0]==0 && m->indices[1]==1 && m->indices[2]==2, "indices 0,1,2");
+        CHECK(r3d_index_at(m->indices,m->index_size,0)==0 && r3d_index_at(m->indices,m->index_size,1)==1 && r3d_index_at(m->indices,m->index_size,2)==2, "indices 0,1,2");
         /* double_sided 在 gltf 设了 → mat_flags bit0 */
         CHECK((m->submeshes[0].mat_flags & 1) != 0, "double_sided flag");
         r3d_model_free(m);

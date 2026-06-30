@@ -48,6 +48,7 @@ typedef struct {
     r3d_vec2_t uv;
     r3d_vec3_t normal;
     float      ao;       /* 环境光遮蔽 [0,1]，1=无遮蔽 */
+    uint32_t   color;    /* 烘焙顶点色 BGRA，0=无(回退到材质 base_color_factor) */
 } r3d_vertex_t;
 
 /* ---- 待上传的位图（create_texture 入参）---- */
@@ -92,11 +93,39 @@ typedef struct {
 typedef struct {
     const r3d_vertex_t *vertices;
     uint32_t            vertex_count;
-    const uint16_t     *indices;
+    const void         *indices;      /* 原生位宽零拷贝(避免嵌入式上额外大块分配) */
     uint32_t            index_count;
+    uint32_t            index_size;    /* 单个索引字节数：2(uint16) 或 4(uint32) */
     r3d_aabb_t          bounds;
     int                 dynamic;  /* 1=顶点每帧变化(morph/skin)，后端总是重传 */
 } r3d_mesh_t;
+
+/* 按位宽读取第 i 个索引(原生 2/4 字节零拷贝缓冲) */
+static inline uint32_t r3d_index_at(const void *idx, uint32_t isize, uint32_t i) {
+    return (isize == 4) ? ((const uint32_t *)idx)[i] : ((const uint16_t *)idx)[i];
+}
+
+/* ---- 光照参数（运行时可调，对齐 glTF 中性环境光观感）----
+ * flat 着色亮度: lit = clamp(ambient + diffuse*max(d,0) + hemi*hemiTerm, 0, lit_max)
+ *   - ambient : 环境项(基础亮度，抬高可减小明暗对比、避免背光死黑)
+ *   - diffuse : 方向光漫反射系数(越大明暗对比越强)
+ *   - hemi    : 半球光系数(按法线 y 给天/地补光)
+ *   - lit_max : 亮度上限(防白色贴图过曝)
+ *   - light_dir : 方向光方向(view 空间，会被归一化)
+ * matcap 材质用独立的柔和系数(见后端)，不受这些影响。 */
+typedef struct {
+    float ambient;     /* 默认 0.55 */
+    float diffuse;     /* 默认 0.45 */
+    float hemi;        /* 默认 0.10 */
+    float lit_max;     /* 默认 0.95 */
+    float light_dir[3];/* 默认 {0.3,0.5,0.8} */
+} r3d_light_params_t;
+
+/* 填入默认值(中性外观，接近 glTF 在中性 IBL 下的漫反射) */
+static inline void r3d_light_params_default(r3d_light_params_t *p) {
+    p->ambient = 0.55f; p->diffuse = 0.45f; p->hemi = 0.10f; p->lit_max = 0.95f;
+    p->light_dir[0] = 0.3f; p->light_dir[1] = 0.5f; p->light_dir[2] = 0.8f;
+}
 
 /* ---- 相机 ---- */
 typedef struct {

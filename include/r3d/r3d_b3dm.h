@@ -12,7 +12,8 @@ extern "C" {
 #endif
 
 #define R3D_B3DM_MAGIC   0x4D443342u  /* 'B','3','D','M' 小端 */
-#define R3D_B3DM_VERSION 3   /* v3: MORPH 段加 vertex_base(morph 顶点在合并缓冲的起始下标) */
+#define R3D_B3DM_VERSION 5   /* v5: 支持 32 位索引(flag IDX32，顶点数>65535)；v4: VTXCOLOR 段；v3: MORPH vertex_base */
+#define R3D_B3DM_VERSION_MIN 3   /* 运行时可加载的最低版本(v3 无 VTXCOLOR 段，向后兼容) */
 
 /* Header flags 位 */
 enum {
@@ -22,12 +23,14 @@ enum {
     R3D_B3DM_FLAG_DROP_Z     = 1u << 3,
     R3D_B3DM_FLAG_MORPH      = 1u << 4,
     R3D_B3DM_FLAG_SKIN       = 1u << 5,
+    R3D_B3DM_FLAG_VTXCOLOR   = 1u << 6,  /* 存在 VTXCOLOR 段：逐顶点烘焙色 */
+    R3D_B3DM_FLAG_IDX32      = 1u << 7,  /* INDEX 段为 32 位索引(顶点数>65535)；否则 16 位 */
 };
 
 /* Section 类型 */
 typedef enum {
     R3D_SEC_VERTEX   = 1,
-    R3D_SEC_INDEX    = 2,
+    R3D_SEC_INDEX    = 2,   /* 默认 uint16；header flag IDX32 置位时为 uint32(顶点数>65535) */
     R3D_SEC_SUBMESH  = 3,
     R3D_SEC_TEXTURE  = 4,
     R3D_SEC_ANIM     = 5,
@@ -35,6 +38,7 @@ typedef enum {
     R3D_SEC_MORPH    = 7,
     R3D_SEC_NODE     = 8,   /* node 树（骨骼动画用）*/
     R3D_SEC_SKINVTX  = 9,   /* 每顶点 joints[4]+weights[4] */
+    R3D_SEC_VTXCOLOR = 10,  /* 每顶点烘焙色 BGRA8888（去纹理材质模式用）*/
 } r3d_b3dm_sec_type_t;
 
 #pragma pack(push, 1)
@@ -74,7 +78,7 @@ typedef struct {
     uint8_t  blend;
     uint8_t  mat_flags;
     uint16_t node_id;      /* 动态 submesh 所属 node(mat_flags bit4=dynamic) */
-    uint32_t index_offset; /* 在 INDEX 段内起始索引 */
+    uint32_t index_offset; /* 在 INDEX 段内起始索引(元素下标，非字节) */
     uint32_t index_count;
     uint32_t base_color_factor; /* ARGB，纯色材质的颜色 */
 } r3d_b3dm_submesh_t;          /* = 20 */
@@ -148,6 +152,13 @@ typedef struct {
     uint8_t joints[4];
     uint8_t weights[4];    /* /255 */
 } r3d_b3dm_skinvtx_t;       /* = 8 */
+
+/* VTXCOLOR 段：每顶点 1 个 BGRA8888 烘焙色（与 VERTEX 段顺序一一对应）。
+ * 去纹理材质模式(baked-vertex)下，离线把纹理/baseColor 采样到顶点色，
+ * 运行时不再需要纹理，只做顶点色插值。BGRA 顺序与 framebuffer 一致。 */
+typedef struct {
+    uint8_t bgra[4];
+} r3d_b3dm_vtxcolor_t;       /* = 4 */
 
 #pragma pack(pop)
 

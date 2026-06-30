@@ -67,7 +67,8 @@ int main(int argc, char **argv)
             if (tl != pass) continue;
             r3d_mesh_t mesh = {0};
             mesh.vertices = m->vertices; mesh.vertex_count = m->vertex_count;
-            mesh.indices = m->indices + sm->index_offset; mesh.index_count = sm->index_count;
+            mesh.indices = (const uint8_t *)m->indices + (size_t)sm->index_offset * m->index_size;
+            mesh.index_count = sm->index_count; mesh.index_size = m->index_size;
             r3d_material_t mat = {0};
             mat.base_color = sm->base_color; mat.matcap = sm->matcap;
             mat.blend = sm->blend; mat.flags = sm->mat_flags;

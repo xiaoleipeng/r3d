@@ -26,8 +26,9 @@ typedef struct {
 typedef struct {
     r3d_vertex_t  *vertices;
     uint32_t       vertex_count;
-    uint16_t      *indices;
+    const void    *indices;        /* 原生位宽零拷贝指向 raw(2 或 4 字节) */
     uint32_t       index_count;
+    uint32_t       index_size;      /* 单个索引字节数：2 或 4 */
 
     r3d_submesh_t *submeshes;
     uint32_t       submesh_count;

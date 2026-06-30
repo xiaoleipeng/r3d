@@ -345,7 +345,7 @@ static void setup_camera(r3d_anim_instance_t *a)
         uint32_t end = sm->index_offset + sm->index_count;
         if (end > m->index_count) end = m->index_count;
         for (uint32_t i = sm->index_offset; i < end; i++) {
-            uint16_t vi = m->indices[i];
+            uint32_t vi = r3d_index_at(m->indices, m->index_size, i);
             if (vi >= m->vertex_count) continue;
             r3d_vec3_t p = m->vertices[vi].pos;
             float wx, wy, wz;
@@ -582,8 +582,10 @@ int r3d_engine_render_frame(r3d_engine_handle handle, float elapsed)
             r3d_mesh_t mesh = {0};
             mesh.vertices = verts;
             mesh.vertex_count = m->vertex_count;
-            mesh.indices = m->indices + sm->index_offset;
+            mesh.indices = (const uint8_t *)m->indices
+                         + (size_t)sm->index_offset * m->index_size;
             mesh.index_count = sm->index_count;
+            mesh.index_size = m->index_size;
             mesh.dynamic = dynamic;
 
             r3d_material_t mat = {0};
@@ -652,5 +654,25 @@ int r3d_engine_screenshot(const char *path)
         }
     }
     fclose(fp);
+    return R3D_ENGINE_OK;
+}
+
+/****************************************************************************
+ * 光照参数（运行时可调）
+ ****************************************************************************/
+
+int r3d_engine_set_lighting(const r3d_light_params_t *lp)
+{
+    if (g_ctx == NULL || g_ctx->be == NULL) return R3D_ENGINE_ERR_INIT;
+    if (g_ctx->be->vt->set_lighting == NULL) return R3D_ENGINE_ERR_PARAM; /* 后端不支持 */
+    g_ctx->be->vt->set_lighting(g_ctx->be, lp);
+    return R3D_ENGINE_OK;
+}
+
+int r3d_engine_get_lighting(r3d_light_params_t *out)
+{
+    if (out == NULL) return R3D_ENGINE_ERR_PARAM;
+    /* 当前后端不回读，直接给默认值供调用方在此基础上微调 */
+    r3d_light_params_default(out);
     return R3D_ENGINE_OK;
 }

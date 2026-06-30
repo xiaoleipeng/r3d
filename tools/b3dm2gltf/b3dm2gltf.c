@@ -69,7 +69,15 @@ int main(int argc,char**argv){
 
     uint32_t vcnt=sv->count, icnt=si->count;
     const r3d_b3dm_vertex_t*qv=(const r3d_b3dm_vertex_t*)(d+sv->offset);
-    const uint16_t*idx=(const uint16_t*)(d+si->offset);
+    /* 索引统一成 32 位数组(文件可能是 16 或 32 位，由 IDX32 标志决定) */
+    int idx_is32 = (h->flags & R3D_B3DM_FLAG_IDX32) ? 1 : 0;
+    uint32_t *idx = (uint32_t*)malloc((size_t)(icnt?icnt:1)*sizeof(uint32_t));
+    if(idx_is32){
+        memcpy(idx, d+si->offset, (size_t)icnt*sizeof(uint32_t));
+    } else {
+        const uint16_t*i16=(const uint16_t*)(d+si->offset);
+        for(uint32_t i=0;i<icnt;i++) idx[i]=i16[i];
+    }
 
     /* 还原顶点 */
     float*pos=(float*)malloc(vcnt*3*4);
@@ -140,7 +148,7 @@ int main(int argc,char**argv){
     }
 
     buf_align4(&bin);
-    uint32_t off_idx=buf_put(&bin,idx,icnt*2);
+    uint32_t off_idx=buf_put(&bin,idx,icnt*4);   /* 32 位索引 */
     buf_align4(&bin);
 
     uint32_t off_ibm=0;
@@ -197,7 +205,7 @@ int main(int argc,char**argv){
         for(uint32_t s=0;s<smcnt && morph_sm<0;s++){
             uint32_t io=qs?qs[s].index_offset:0, ic=qs?qs[s].index_count:icnt;
             uint32_t mn=0xffffffffu,mx=0;
-            for(uint32_t e=0;e<ic;e++){ uint16_t v=idx[io+e]; if(v<mn)mn=v; if(v>mx)mx=v; }
+            for(uint32_t e=0;e<ic;e++){ uint32_t v=idx[io+e]; if(v<mn)mn=v; if(v>mx)mx=v; }
             if(mx>=mn && (mx-mn+1)==morph_vc){ morph_sm=(int)s; morph_vbase=mn; }
         }
         if(morph_sm<0){ morph_tc=0; } /* 没匹配到则放弃 morph */
@@ -249,7 +257,7 @@ int main(int argc,char**argv){
     fprintf(g,"{\"buffer\":0,\"byteOffset\":%u,\"byteLength\":%u,\"target\":34962},\n",off_pos,vcnt*3*4);
     fprintf(g,"{\"buffer\":0,\"byteOffset\":%u,\"byteLength\":%u,\"target\":34962},\n",off_nrm,vcnt*3*4);
     fprintf(g,"{\"buffer\":0,\"byteOffset\":%u,\"byteLength\":%u,\"target\":34962},\n",off_uv,vcnt*2*4);
-    fprintf(g,"{\"buffer\":0,\"byteOffset\":%u,\"byteLength\":%u,\"target\":34963}",off_idx,icnt*2);
+    fprintf(g,"{\"buffer\":0,\"byteOffset\":%u,\"byteLength\":%u,\"target\":34963}",off_idx,icnt*4);
     if(has_skin){
         fprintf(g,",\n{\"buffer\":0,\"byteOffset\":%u,\"byteLength\":%u}",off_joints,vcnt*4*2);
         fprintf(g,",\n{\"buffer\":0,\"byteOffset\":%u,\"byteLength\":%u}",off_weights,vcnt*4*4);
@@ -273,7 +281,7 @@ int main(int argc,char**argv){
     fprintf(g,"{\"bufferView\":%d,\"componentType\":5126,\"count\":%u,\"type\":\"VEC2\"}",bvUv,vcnt);
     for(uint32_t s=0;s<smcnt;s++){
         uint32_t io=qs?qs[s].index_offset:0, ic=qs?qs[s].index_count:icnt;
-        fprintf(g,",\n{\"bufferView\":%d,\"byteOffset\":%u,\"componentType\":5123,\"count\":%u,\"type\":\"SCALAR\"}",bvIdx,io*2,ic);
+        fprintf(g,",\n{\"bufferView\":%d,\"byteOffset\":%u,\"componentType\":5125,\"count\":%u,\"type\":\"SCALAR\"}",bvIdx,io*4,ic);
     }
     if(has_skin){
         fprintf(g,",\n{\"bufferView\":%d,\"componentType\":5123,\"count\":%u,\"type\":\"VEC4\"}",bvJoints,vcnt);    /* JOINTS u16 */
@@ -348,8 +356,14 @@ int main(int argc,char**argv){
      *      submesh-mesh 挂到其 node_id 对应的 node(mesh 属性)。这样 node 链的
      *      TRS(量化模型的 scale/translation)会正确作用，动态顶点不再错位。
      *      同一 node 被多 submesh 引用时，第一个直接挂，其余追加为子节点。
-     *  (b) 无 NODE 段：每个 submesh 一个引用 mesh 的根 node。 */
-    if(nodecnt>0){
+     *  (b) 无 NODE 段，或纯静态模型：每个 submesh 一个引用 mesh 的根 node。
+     *
+     * 关键：静态(非 skin/morph)模型的顶点已在离线烘焙到世界空间(乘过各 node 的
+     * 世界矩阵)，若再用 node 树的 TRS 就会二次变换 → 零件错位(如 ferrari 轮子飞出)。
+     * 故仅当存在 skin 或 morph(顶点未烘焙、依赖运行时节点/蒙皮变换)时才输出 node 树；
+     * 纯静态模型一律走扁平单位 node 路径。 */
+    int need_node_tree = (nodecnt>0) && (has_skin || morph_tc>0);
+    if(need_node_tree){
         int *node_mesh=(int*)malloc(sizeof(int)*nodecnt);
         for(uint32_t i=0;i<nodecnt;i++) node_mesh[i]=-1;
         int *extra_sm=(int*)malloc(sizeof(int)*(smcnt?smcnt:1));

@@ -35,6 +35,7 @@
 #define __R3D_ENGINE_H__
 
 #include <stdint.h>
+#include "r3d/r3d_types.h"
 
 typedef void *r3d_engine_handle;
 
@@ -72,6 +73,12 @@ void r3d_engine_set_zoom(r3d_engine_handle handle, float dist_scale);
 
 /* 截图：把当前 framebuffer 存为 PPM。返回 0 成功。 */
 int r3d_engine_screenshot(const char *path);
+
+/* 光照参数（运行时可调，所见即所得地贴近 glTF 中性外观）。
+ * 传 NULL 恢复默认。后端不支持时静默忽略。返回 0 成功。 */
+int r3d_engine_set_lighting(const r3d_light_params_t *lp);
+/* 取当前光照参数(便于在默认基础上微调)。返回 0 成功。 */
+int r3d_engine_get_lighting(r3d_light_params_t *out);
 
 #ifdef __cplusplus
 }

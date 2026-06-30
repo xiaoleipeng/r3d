@@ -123,7 +123,7 @@ static void test_loader(void)
         CHECK(almost(m->vertices[1].pos.x, 1.0f), "vtx1.x decoded == 1.0");
         CHECK(almost(m->vertices[2].pos.y, 1.0f), "vtx2.y decoded == 1.0");
         CHECK(almost(m->vertices[1].uv.x, 1.0f), "vtx1.uv.x == 1.0");
-        CHECK(m->indices[0]==0 && m->indices[1]==1 && m->indices[2]==2, "indices");
+        CHECK(r3d_index_at(m->indices,m->index_size,0)==0 && r3d_index_at(m->indices,m->index_size,1)==1 && r3d_index_at(m->indices,m->index_size,2)==2, "indices");
 
         /* 跑通 vtable 分发：begin/set_camera/draw/end */
         r3d_target_t tgt = {0}; tgt.w=64; tgt.h=64;
@@ -132,7 +132,7 @@ static void test_loader(void)
         be->vt->set_camera(be, &cam);
         r3d_mesh_t mesh = {0};
         mesh.vertices=m->vertices; mesh.vertex_count=m->vertex_count;
-        mesh.indices=m->indices;   mesh.index_count=m->index_count;
+        mesh.indices=m->indices;   mesh.index_count=m->index_count; mesh.index_size=m->index_size;
         r3d_mat4_t model; r3d_mat4_identity(&model);
         r3d_material_t mat = {0};
         be->vt->draw(be, &mesh, &model, &mat);

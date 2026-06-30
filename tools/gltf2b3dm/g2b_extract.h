@@ -377,8 +377,10 @@ static int g2b_extract(cgltf_data *d, const char *gltf_path,
                     }
                     wp->verts[i].nx=nn[0]; wp->verts[i].ny=nn[1]; wp->verts[i].nz=nn[2];
                 }
-                else { wp->verts[i].nz=1.0f; }
+                else { wp->verts[i].nx=0.0f; wp->verts[i].ny=0.0f; wp->verts[i].nz=0.0f; }
             }
+            /* 源是否提供法线(否则下面按面计算 flat 法线) */
+            int had_normals = (draco_ok ? (dm.normal!=NULL) : (anrm!=NULL));
             /* 索引 */
             if (draco_ok){
                 wp->icount=dm.index_count;
@@ -395,6 +397,35 @@ static int g2b_extract(cgltf_data *d, const char *gltf_path,
                 for(uint32_t i=0;i<wp->icount;i++) wp->idx[i]=(uint16_t)i;
             }
             sc->total_tris += wp->icount/3;
+
+            /* 源无法线：按面计算 flat 法线(行业惯例兜底)。用三角形两边叉乘，
+             * 累加到三个顶点后归一化。顶点位置此时已在与法线一致的空间(静态=世界、
+             * 蒙皮=局部)，故法线空间正确。低模(如 Fox)由此恢复硬边分面着色，
+             * 而非之前恒定 +Z 法线导致的平淡均匀着色。 */
+            if (!had_normals && wp->icount>=3) {
+                for(uint32_t i=0;i<wp->icount;i+=3){
+                    uint32_t a=wp->idx[i], b=wp->idx[i+1], c=wp->idx[i+2];
+                    if(a>=wp->vcount||b>=wp->vcount||c>=wp->vcount) continue;
+                    float ux=wp->verts[b].px-wp->verts[a].px;
+                    float uy=wp->verts[b].py-wp->verts[a].py;
+                    float uz=wp->verts[b].pz-wp->verts[a].pz;
+                    float vx=wp->verts[c].px-wp->verts[a].px;
+                    float vy=wp->verts[c].py-wp->verts[a].py;
+                    float vz=wp->verts[c].pz-wp->verts[a].pz;
+                    float nx=uy*vz-uz*vy, ny=uz*vx-ux*vz, nz=ux*vy-uy*vx;
+                    /* 累加(共享顶点时近似 area-weighted)；非索引网格则每面独立=精确 flat */
+                    wp->verts[a].nx+=nx; wp->verts[a].ny+=ny; wp->verts[a].nz+=nz;
+                    wp->verts[b].nx+=nx; wp->verts[b].ny+=ny; wp->verts[b].nz+=nz;
+                    wp->verts[c].nx+=nx; wp->verts[c].ny+=ny; wp->verts[c].nz+=nz;
+                }
+                for(uint32_t i=0;i<wp->vcount;i++){
+                    float l=sqrtf(wp->verts[i].nx*wp->verts[i].nx
+                                + wp->verts[i].ny*wp->verts[i].ny
+                                + wp->verts[i].nz*wp->verts[i].nz);
+                    if(l>1e-8f){ wp->verts[i].nx/=l; wp->verts[i].ny/=l; wp->verts[i].nz/=l; }
+                    else { wp->verts[i].nz=1.0f; } /* 退化三角形兜底 */
+                }
+            }
 
             /* skin 顶点属性: JOINTS_0(u8x4) + WEIGHTS_0(归一) */
             wp->joints=NULL; wp->weights=NULL;
@@ -605,7 +636,7 @@ static int g2b_extract(cgltf_data *d, const char *gltf_path,
 }
 
 static void g2b_scene_free(g2b_scene_t *sc){
-    for(uint32_t i=0;i<sc->prim_count;i++){ free(sc->prims[i].verts); free(sc->prims[i].idx); free(sc->prims[i].morph_delta); free(sc->prims[i].joints); free(sc->prims[i].weights); }
+    for(uint32_t i=0;i<sc->prim_count;i++){ free(sc->prims[i].verts); free(sc->prims[i].idx); free(sc->prims[i].morph_delta); free(sc->prims[i].joints); free(sc->prims[i].weights); free(sc->prims[i].vcolor); }
     free(sc->prims);
     for(uint32_t i=0;i<sc->tex_count;i++) free(sc->texs[i].rgba);
     free(sc->texs);

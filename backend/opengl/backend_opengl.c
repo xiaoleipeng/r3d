@@ -33,15 +33,18 @@ static const char *VS_SRC =
     "attribute vec2 a_uv;\n"
     "attribute vec3 a_nrm;\n"
     "attribute float a_ao;\n"
+    "attribute vec4 a_col;\n"
     "varying vec2 v_uv;\n"
     "varying vec3 v_nv;\n"
     "varying float v_ao;\n"
+    "varying vec4 v_col;\n"
     "varying float v_flat;\n"
     "void main(){\n"
     "  gl_Position = u_mvp * vec4(a_pos,1.0);\n"
     "  v_uv = a_uv;\n"
     "  v_nv = u_v3 * a_nrm;\n"
     "  v_ao = a_ao;\n"
+    "  v_col = a_col;\n"
     "  v_flat = u_flat;\n"
     "}\n";
 
@@ -55,6 +58,7 @@ static const char *FS_SRC =
     "varying vec2 v_uv;\n"
     "varying vec3 v_nv;\n"
     "varying float v_ao;\n"
+    "varying vec4 v_col;\n"
     "varying float v_flat;\n"
     "void main(){\n"
     "  vec3 nv = normalize(v_nv);\n"
@@ -64,7 +68,11 @@ static const char *FS_SRC =
     "    gl_FragColor = vec4(mc * u_tint.rgb * v_ao, u_tint.a);\n"
     "    return;\n"
     "  }\n"
-    "  vec4 base = mix(u_tint, texture2D(u_tex, v_uv)*u_tint, u_use_tex);\n"
+    /* 无纹理且有顶点色(baked-vertex 模式)时优先用顶点色，否则用 tint。
+       顶点色按 ARGB u32 存储，小端逐字节读入为 (B,G,R,A)，故取 .bgra 还原 RGBA */
+    "  vec4 vcol = v_col.bgra;\n"
+    "  vec4 tint = mix(u_tint, vcol, (1.0 - u_use_tex) * step(0.001, vcol.a));\n"
+    "  vec4 base = mix(tint, texture2D(u_tex, v_uv)*u_tint, u_use_tex);\n"
     "  vec3 L = normalize(u_light);\n"
     "  vec3 V = vec3(0.0,0.0,1.0);\n"
     "  vec3 H = normalize(L+V);\n"
@@ -110,6 +118,7 @@ static r3d_result_t gl_init(r3d_backend_t *self, const r3d_backend_cfg_t *cfg){
     glBindAttribLocation(im->prog,1,"a_uv");
     glBindAttribLocation(im->prog,2,"a_nrm");
     glBindAttribLocation(im->prog,3,"a_ao");
+    glBindAttribLocation(im->prog,4,"a_col");
     glLinkProgram(im->prog);
     GLint ok=0; glGetProgramiv(im->prog,GL_LINK_STATUS,&ok);
     if(!ok){ char log[512]; glGetProgramInfoLog(im->prog,512,NULL,log); fprintf(stderr,"link: %s\n",log); return R3D_ERR_UNSUPPORTED; }
@@ -234,7 +243,7 @@ static void gl_draw(r3d_backend_t *self, const r3d_mesh_t *mesh,
     }
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER,im->ebo);
     if(mesh->indices!=im->last_iptr || mesh->index_count!=im->last_icount){
-        glBufferData(GL_ELEMENT_ARRAY_BUFFER,(GLsizeiptr)mesh->index_count*sizeof(uint16_t),mesh->indices,GL_STATIC_DRAW);
+        glBufferData(GL_ELEMENT_ARRAY_BUFFER,(GLsizeiptr)mesh->index_count*mesh->index_size,mesh->indices,GL_STATIC_DRAW);
         im->last_iptr=mesh->indices; im->last_icount=mesh->index_count;
     }
 
@@ -247,8 +256,12 @@ static void gl_draw(r3d_backend_t *self, const r3d_mesh_t *mesh,
     glVertexAttribPointer(im->a_nrm,3,GL_FLOAT,GL_FALSE,stride,(void*)(sizeof(float)*5));
     glEnableVertexAttribArray(3);
     glVertexAttribPointer(3,1,GL_FLOAT,GL_FALSE,stride,(void*)(sizeof(float)*8));
+    /* a_col: 顶点色 uint32(BGRA 字节) → 归一化 4×u8，偏移在 ao 之后 */
+    glEnableVertexAttribArray(4);
+    glVertexAttribPointer(4,4,GL_UNSIGNED_BYTE,GL_TRUE,stride,(void*)(sizeof(float)*9));
 
-    glDrawElements(GL_TRIANGLES,(GLsizei)mesh->index_count,GL_UNSIGNED_SHORT,0);
+    glDrawElements(GL_TRIANGLES,(GLsizei)mesh->index_count,
+                   mesh->index_size==4?GL_UNSIGNED_INT:GL_UNSIGNED_SHORT,0);
 }
 
 static void gl_end_frame(r3d_backend_t *self){ (void)self; glFlush(); }

@@ -27,13 +27,39 @@ typedef struct {
     const char *matcap_gold;
     const char *matcap_silver;
     const char *variant; /* KHR_materials_variants 变体名子串(如 Gold) */
+    int   mat_mode;      /* 材质模式：见 G2B_MAT_* */
+    float morph_lock_ratio;   /* morph 顶点形变活跃度阈值(×包围盒对角线)，超过则锁定 */
+    float morph_lock_max_pct; /* morph 锁定顶点占比上限(0..1)，防过锁减不动 */
+    float anim_error;         /* 动画网格(蒙皮/morph)减面误差阈值 */
 } opts_t;
+
+/* 材质/纹理输出模式（行业惯例的材质降级谱系）*/
+enum {
+    G2B_MAT_FULL = 0,    /* 保留纹理烘焙(默认) */
+    G2B_MAT_BAKED_VERTEX,/* 纹理→逐顶点色，丢弃贴图(去纹理主方案) */
+    G2B_MAT_SOLID,       /* 每 prim 用贴图平均色/baseColor 单色 */
+    G2B_MAT_NONE,        /* 纯几何，统一中灰(调试/线框) */
+};
+
+static int parse_mat_mode(const char *s) {
+    if (!strcmp(s, "full"))         return G2B_MAT_FULL;
+    if (!strcmp(s, "baked-vertex")) return G2B_MAT_BAKED_VERTEX;
+    if (!strcmp(s, "solid"))        return G2B_MAT_SOLID;
+    if (!strcmp(s, "none"))         return G2B_MAT_NONE;
+    return -1;
+}
 
 static void usage(const char *p) {
     fprintf(stderr,
       "用法: %s input.gltf output.b3dm [选项]\n"
       "  --max-tris N      减面预算(默认 0=不减)\n"
-      "  --tex-size N      纹理降采样上限(默认 256)\n", p);
+      "  --tex-size N      纹理降采样上限(默认 256)\n"
+      "  --material-mode M 材质模式: full(默认)|baked-vertex|solid|none\n"
+      "                    full=保留纹理; baked-vertex=纹理烘进顶点色去贴图;\n"
+      "                    solid=每件贴图平均色单色; none=统一中灰\n"
+      "  --morph-lock-ratio R   morph 形变位移>R×包围盒的顶点锁定(默认 0.002)\n"
+      "  --morph-lock-max-pct P morph 锁定顶点占比上限(默认 0.4)\n"
+      "  --anim-error E         蒙皮/morph 减面误差阈值(默认 0.01)\n", p);
 }
 
 static int parse_opts(int argc, char **argv, opts_t *o) {
@@ -42,6 +68,9 @@ static int parse_opts(int argc, char **argv, opts_t *o) {
     o->detail_tex_size = 1024;
     o->quantize_pos = 16;
     o->anim_fps = 30.0f;
+    o->morph_lock_ratio = 0.002f;
+    o->morph_lock_max_pct = 0.40f;
+    o->anim_error = 0.01f;
     if (argc < 3) return -1;
     o->input = argv[1];
     o->output = argv[2];
@@ -54,6 +83,13 @@ static int parse_opts(int argc, char **argv, opts_t *o) {
         else if (!strcmp(argv[i], "--matcap-gold") && i+1 < argc) o->matcap_gold = argv[++i];
         else if (!strcmp(argv[i], "--matcap-silver") && i+1 < argc) o->matcap_silver = argv[++i];
         else if (!strcmp(argv[i], "--variant") && i+1 < argc) o->variant = argv[++i];
+        else if (!strcmp(argv[i], "--material-mode") && i+1 < argc) {
+            o->mat_mode = parse_mat_mode(argv[++i]);
+            if (o->mat_mode < 0) { fprintf(stderr, "未知 material-mode: %s\n", argv[i]); return -1; }
+        }
+        else if (!strcmp(argv[i], "--morph-lock-ratio") && i+1 < argc) o->morph_lock_ratio = (float)atof(argv[++i]);
+        else if (!strcmp(argv[i], "--morph-lock-max-pct") && i+1 < argc) o->morph_lock_max_pct = (float)atof(argv[++i]);
+        else if (!strcmp(argv[i], "--anim-error") && i+1 < argc) o->anim_error = (float)atof(argv[++i]);
         else { fprintf(stderr, "未知选项: %s\n", argv[i]); return -1; }
     }
     return 0;
@@ -74,6 +110,7 @@ typedef struct {
     uint8_t  *weights;       /* [vcount*4] 权重 /255 */
     int       node_id;       /* 所属 node 索引 */
     int       is_dynamic;    /* 被动画驱动(不烘焙节点变换) */
+    uint32_t *vcolor;        /* [vcount] 逐顶点烘焙色 ARGB，NULL=无(baked-vertex 模式生成) */
 } wprim_t;
 
 /* ---- oct 法线编码 ---- */
@@ -93,6 +130,7 @@ static void oct_encode(float nx, float ny, float nz, int16_t *ox, int16_t *oy) {
 #include "g2b_extract.h"  /* cgltf 提取 → wprim_t 列表 */
 #include "g2b_skin.h"     /* node 树 + skin 提取 */
 #include "g2b_simplify.h" /* meshoptimizer 减面 */
+#include "g2b_material.h" /* 材质/纹理输出模式(去纹理/顶点色/单色) */
 #include "g2b_write.h"    /* wprim_t 列表 + 纹理 + 动画 → B3DM 序列化 */
 
 int main(int argc, char **argv) {
@@ -124,7 +162,10 @@ int main(int argc, char **argv) {
     cgltf_free(data);
 
     /* 2.5 减面 + cache 优化 */
-    g2b_simplify(&scene, (uint32_t)o.max_tris);
+    g2b_simplify(&scene, (uint32_t)o.max_tris, &o);
+
+    /* 2.6 材质模式：去纹理/顶点色/单色（在减面后，保 UV 采样更准）*/
+    g2b_apply_material_mode(&scene, &o);
 
     /* 3. 序列化 B3DM */
     if (g2b_write(&scene, &o) != 0) {
