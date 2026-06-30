@@ -40,10 +40,14 @@ static uint8_t* g2b_build_skinvtx(g2b_scene_t *sc, uint32_t *out_len){
     *out_len=len; return b;
 }
 
-/* 构建 MORPH 段 blob（单 prim 假设，取 prims[0]）。无 morph 返回 NULL */
-static uint8_t* g2b_build_morph(g2b_scene_t *sc, uint32_t *out_len){
-    if (sc->prim_count==0 || sc->prims[0].morph_count==0){ *out_len=0; return NULL; }
-    wprim_t *wp=&sc->prims[0];
+/* 构建 MORPH 段 blob。在所有 prim 中查找首个带 morph 的 prim(不限 prims[0])，
+ * 兼容 morph 不在第一个 primitive 的模型(如 facecap)。无 morph 返回 NULL。
+ * vertex_base: 该 prim 顶点在合并缓冲中的起始全局下标(由调用方在写顶点时算出)。 */
+static uint8_t* g2b_build_morph(g2b_scene_t *sc, uint32_t vertex_base, uint32_t *out_len){
+    int mp=-1;
+    for(uint32_t i=0;i<sc->prim_count;i++) if(sc->prims[i].morph_count>0){ mp=(int)i; break; }
+    if (mp<0){ *out_len=0; return NULL; }
+    wprim_t *wp=&sc->prims[mp];
     uint32_t off_hdr=0;
     uint32_t off_deltas=align16(sizeof(r3d_b3dm_morph_t));
     uint32_t dbytes=(uint32_t)wp->morph_count*wp->vcount*3*4;
@@ -52,6 +56,7 @@ static uint8_t* g2b_build_morph(g2b_scene_t *sc, uint32_t *out_len){
     r3d_b3dm_morph_t *mh=(r3d_b3dm_morph_t*)(blob+off_hdr);
     mh->target_count=wp->morph_count; mh->vertex_count=wp->vcount;
     mh->deltas_offset=off_deltas;
+    mh->vertex_base=vertex_base;
     memcpy(blob+off_deltas, wp->morph_delta, dbytes);
     *out_len=total;
     return blob;
@@ -148,9 +153,15 @@ static int g2b_write(g2b_scene_t *sc, const opts_t *o) {
     typedef struct { int tex,blend,flags; uint32_t ioff,icount,bcf; int nid; } sm_t;
     sm_t *sms=(sm_t*)calloc(sc->prim_count,sizeof(sm_t)); uint32_t sm_n=0;
     uint32_t vbase=0, ioff=0;
+    /* morph 所属 prim：与 g2b_build_morph 一致，取原始顺序首个带 morph 的 prim */
+    int morph_prim=-1;
+    for(uint32_t i=0;i<sc->prim_count;i++) if(sc->prims[i].morph_count>0){ morph_prim=(int)i; break; }
+    uint32_t morph_vbase=0;  /* 该 prim 在合并缓冲的起始全局顶点下标 */
 
     for(uint32_t oi=0; oi<sc->prim_count; oi++){
         wprim_t *wp=&sc->prims[order[oi]];
+        /* 记录 morph prim 的全局顶点起始(用于 MORPH 段 vertex_base) */
+        if(morph_prim>=0 && (int)order[oi]==morph_prim) morph_vbase=vbase;
         /* 顶点定点化写入 */
         for(uint32_t i=0;i<wp->vcount;i++){
             r3d_b3dm_vertex_t qv; memset(&qv,0,sizeof qv);
@@ -230,7 +241,7 @@ static int g2b_write(g2b_scene_t *sc, const opts_t *o) {
 
     /* ---- 5. 各段 blob 统一组装（游标 16 对齐推进）---- */
     uint32_t anim_len=0; uint8_t *anim_blob=g2b_build_anim(sc,&anim_len);
-    uint32_t morph_len=0; uint8_t *morph_blob=g2b_build_morph(sc,&morph_len);
+    uint32_t morph_len=0; uint8_t *morph_blob=g2b_build_morph(sc,morph_vbase,&morph_len);
     uint32_t node_len=0; uint8_t *node_blob=g2b_build_node(sc,&node_len);
     uint32_t skel_len=0; uint8_t *skel_blob=g2b_build_skeleton(sc,&skel_len);
     uint32_t skv_len=0;  uint8_t *skv_blob=g2b_build_skinvtx(sc,&skv_len);
@@ -242,7 +253,11 @@ static int g2b_write(g2b_scene_t *sc, const opts_t *o) {
     if(sm_n)        segs[ns++]=(typeof(segs[0])){R3D_SEC_SUBMESH, smbuf.p, smbuf.len, sm_n};
     if(sc->tex_count)segs[ns++]=(typeof(segs[0])){R3D_SEC_TEXTURE, texblob.p, texblob.len, sc->tex_count};
     if(anim_len)    segs[ns++]=(typeof(segs[0])){R3D_SEC_ANIM, anim_blob, anim_len, sc->clip_count};
-    if(morph_len)   segs[ns++]=(typeof(segs[0])){R3D_SEC_MORPH, morph_blob, morph_len, sc->prims[0].morph_count};
+    if(morph_len){
+        uint32_t mcount=0;
+        for(uint32_t i=0;i<sc->prim_count;i++) if(sc->prims[i].morph_count>0){ mcount=sc->prims[i].morph_count; break; }
+        segs[ns++]=(typeof(segs[0])){R3D_SEC_MORPH, morph_blob, morph_len, mcount};
+    }
     if(node_len)    segs[ns++]=(typeof(segs[0])){R3D_SEC_NODE, node_blob, node_len, sc->node_count};
     if(skel_len)    segs[ns++]=(typeof(segs[0])){R3D_SEC_SKELETON, skel_blob, skel_len, sc->joint_count};
     if(skv_len)     segs[ns++]=(typeof(segs[0])){R3D_SEC_SKINVTX, skv_blob, skv_len, total_v};

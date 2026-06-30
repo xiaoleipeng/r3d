@@ -87,6 +87,8 @@ static void oct_encode(float nx, float ny, float nz, int16_t *ox, int16_t *oy) {
     *ox = (int16_t)xi; *oy = (int16_t)yi;
 }
 
+#include "g2b_meshopt_decode.h" /* 解压 EXT_meshopt_compression buffer_view */
+#include "g2b_draco.h"    /* Draco 解码桥接 */
 #include "g2b_anim.h"     /* 动画提取(定义 wclip_t) */
 #include "g2b_extract.h"  /* cgltf 提取 → wprim_t 列表 */
 #include "g2b_skin.h"     /* node 树 + skin 提取 */
@@ -105,6 +107,11 @@ int main(int argc, char **argv) {
     }
     if (cgltf_load_buffers(&gopt, data, o.input) != cgltf_result_success) {
         fprintf(stderr, "加载 buffer 失败\n"); cgltf_free(data); return 1;
+    }
+
+    /* 1.5 解压 EXT_meshopt_compression（cgltf 不自动解压）*/
+    if (g2b_decode_meshopt(data) != 0) {
+        fprintf(stderr, "警告: 存在无法解压的 meshopt buffer_view，结果可能不完整\n");
     }
 
     /* 2. 提取 primitives + 纹理 */

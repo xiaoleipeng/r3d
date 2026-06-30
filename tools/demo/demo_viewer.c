@@ -50,16 +50,54 @@ int main(int argc, char **argv){
             printf("skin: %u nodes, %u joints\n", m->node_count, m->joint_count); }
     }
 
-    /* 包围球半径，用于相机距离 */
-    float r = m->bounds.max.x - m->bounds.min.x;
-    float ry= m->bounds.max.y - m->bounds.min.y;
-    if(ry>r)r=ry; if(r<1e-3f)r=1.0f;
-    r3d_vec3_t center={ (m->bounds.min.x+m->bounds.max.x)*0.5f,
-                        (m->bounds.min.y+m->bounds.max.y)*0.5f,
-                        (m->bounds.min.z+m->bounds.max.z)*0.5f };
+    /* ---- 相机取景：用“实际渲染后”的顶点包围盒 ----
+     * header.bounding_sphere 是 raw(变换前)顶点空间的；而真正画出来的几何是经过
+     * 蒙皮/morph 以及每个 submesh 的 node 矩阵变换后的。两者尺度/中心可能差几个
+     * 数量级(如 facecap 的 node 把 ~9813 半径缩到 ~1.9)，直接用 header 会把相机
+     * 对准空无一物的地方。这里按 draw 循环的同样变换跑一遍 t=0 的几何来求真包围盒。 */
+    if(animated) r3d_anim_update(&ast, 0.0f);   /* 初始化 root/morph 权重到首帧 */
+    const r3d_vertex_t *bverts = m->vertices;
+    if(has_skin)      { r3d_skin_update(&skin, m, &ast); bverts=skin.out; }
+    else if(has_morph){ r3d_deform_apply(&deform, m, ast.morph_weights, ast.morph_weight_count); bverts=deform.out; }
 
-    /* orbit 相机初始状态 */
-    float dist0 = r*1.6f + 0.5f;
+    r3d_mat4_t bmodel; r3d_mat4_identity(&bmodel);
+    if(animated && m->node_count<=1) bmodel=ast.root_matrix;
+    if(has_skin) r3d_mat4_identity(&bmodel);
+
+    r3d_vec3_t bmin={ 1e30f, 1e30f, 1e30f}, bmax={-1e30f,-1e30f,-1e30f};
+    extern void r3d_mat4_mul(r3d_mat4_t*,const r3d_mat4_t*,const r3d_mat4_t*);
+    for(uint32_t s=0;s<m->submesh_count;s++){
+        r3d_submesh_t *sm=&m->submeshes[s];
+        r3d_mat4_t smodel=bmodel;
+        if((sm->mat_flags & R3D_MAT_DYNAMIC_NODE) && animated)
+            r3d_anim_node_matrix(m,&ast,sm->node_id,&smodel);
+        for(uint32_t ii=0; ii<sm->index_count; ii++){
+            uint16_t vi = m->indices[sm->index_offset+ii];
+            if(vi>=m->vertex_count) continue;
+            r3d_vec3_t p = bverts[vi].pos;
+            r3d_vec4_t in={p.x,p.y,p.z,1.0f};
+            r3d_vec4_t o = r3d_mat4_mul_vec4(&smodel,in);
+            float x=o.x,y=o.y,z=o.z;
+            if(x<bmin.x)bmin.x=x; if(y<bmin.y)bmin.y=y; if(z<bmin.z)bmin.z=z;
+            if(x>bmax.x)bmax.x=x; if(y>bmax.y)bmax.y=y; if(z>bmax.z)bmax.z=z;
+        }
+    }
+    r3d_vec3_t center; float r;
+    if(bmax.x>=bmin.x){
+        center=(r3d_vec3_t){(bmin.x+bmax.x)*0.5f,(bmin.y+bmax.y)*0.5f,(bmin.z+bmax.z)*0.5f};
+        float dx=bmax.x-bmin.x, dy=bmax.y-bmin.y, dz=bmax.z-bmin.z;
+        r = 0.5f*sqrtf(dx*dx+dy*dy+dz*dz);   /* 包围球半径 = 半对角线 */
+    } else { /* 兜底：用 header */
+        center=(r3d_vec3_t){(m->bounds.min.x+m->bounds.max.x)*0.5f,
+                            (m->bounds.min.y+m->bounds.max.y)*0.5f,
+                            (m->bounds.min.z+m->bounds.max.z)*0.5f};
+        r=(m->bounds.max.x-m->bounds.min.x);
+    }
+    if(r<1e-4f)r=1.0f;
+    printf("取景: center=(%.3f,%.3f,%.3f) radius=%.3f\n",center.x,center.y,center.z,r);
+
+    /* orbit 相机初始状态：fovy=1.0rad，距离取 radius/tan(fovy/2)*留白 */
+    float dist0 = r*2.2f;
     float yaw=0.0f, pitch=0.4f, dist=dist0;
     if(getenv("R3D_YAW")) yaw=(float)atof(getenv("R3D_YAW"));
     if(getenv("R3D_PITCH")) pitch=(float)atof(getenv("R3D_PITCH"));
@@ -103,7 +141,11 @@ int main(int argc, char **argv){
                          target.z+dist*cosf(pitch)*cosf(yaw) };
         r3d_camera_t cam;
         r3d_mat4_look_at(&cam.view, eye, target, (r3d_vec3_t){0,1,0});
-        r3d_mat4_perspective(&cam.proj, 1.0f, 800.0f/600.0f, 0.05f, 100.0f);
+        /* 近/远平面随模型尺寸与相机距离自适应，避免大尺度模型(Fox/facecap)
+         * 整体落在远裁剪面之外而看不见 */
+        float zfar = (dist + r*4.0f) * 2.0f;
+        float znear = zfar * 0.001f;
+        r3d_mat4_perspective(&cam.proj, 1.0f, 800.0f/600.0f, znear, zfar);
 
         r3d_target_t tgt={0}; tgt.w=800; tgt.h=600;
         be->vt->begin_frame(be,&tgt);

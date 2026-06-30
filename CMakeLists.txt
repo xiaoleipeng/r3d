@@ -87,6 +87,10 @@ if(R3D_BUILD_TOOLS)
         tools/gltf2b3dm/third_party/meshopt/vcacheoptimizer.cpp
         tools/gltf2b3dm/third_party/meshopt/vfetchoptimizer.cpp
         tools/gltf2b3dm/third_party/meshopt/quantization.cpp
+        tools/gltf2b3dm/third_party/meshopt/vertexcodec.cpp
+        tools/gltf2b3dm/third_party/meshopt/indexcodec.cpp
+        tools/gltf2b3dm/third_party/meshopt/vertexfilter.cpp
+        tools/gltf2b3dm/g2b_draco.cpp
     )
     target_include_directories(gltf2b3dm PRIVATE
         include tools/gltf2b3dm tools/gltf2b3dm/third_party
@@ -96,6 +100,24 @@ if(R3D_BUILD_TOOLS)
         target_link_libraries(gltf2b3dm PRIVATE ${M_LIB_TOOL})
     endif()
     target_compile_options(gltf2b3dm PRIVATE -w)
+
+    # ---- 可选 Draco 解码支持（KHR_draco_mesh_compression）----
+    # 需先拉取源码: third_party/draco_src（见 tools/gltf2b3dm/README）
+    # git clone --depth 1 -b 1.5.7 https://github.com/google/draco.git \
+    #     tools/gltf2b3dm/third_party/draco_src
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tools/gltf2b3dm/third_party/draco_src/CMakeLists.txt")
+        set(DRACO_TRANSCODER_SUPPORTED OFF CACHE BOOL "" FORCE)
+        set(DRACO_TESTS OFF CACHE BOOL "" FORCE)
+        add_subdirectory(tools/gltf2b3dm/third_party/draco_src draco_build EXCLUDE_FROM_ALL)
+        target_compile_definitions(gltf2b3dm PRIVATE G2B_HAVE_DRACO)
+        target_include_directories(gltf2b3dm PRIVATE
+            tools/gltf2b3dm/third_party/draco_src/src
+            ${CMAKE_CURRENT_BINARY_DIR})
+        target_link_libraries(gltf2b3dm PRIVATE draco_static)
+        message(STATUS "gltf2b3dm: Draco 解码已启用")
+    else()
+        message(STATUS "gltf2b3dm: 未找到 draco_src，KHR_draco_mesh_compression 模型将被跳过")
+    endif()
 
     add_executable(b3dm2gltf tools/b3dm2gltf/b3dm2gltf.c)
     target_include_directories(b3dm2gltf PRIVATE include tools/gltf2b3dm/third_party)

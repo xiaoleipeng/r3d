@@ -147,7 +147,17 @@ r3d_model_t *r3d_model_load_mem(r3d_backend_t *backend, void *buf, uint32_t size
     if (smo) {
         const r3d_b3dm_morph_t *mh = (const r3d_b3dm_morph_t *)(base + smo->offset);
         m->morph_target_count = mh->target_count;
+        m->morph_vertex_count = mh->vertex_count;
+        m->morph_vertex_base  = mh->vertex_base;
         m->morph_deltas = (const float *)(base + smo->offset + mh->deltas_offset);
+        /* 防御：morph 顶点范围必须落在模型顶点内，否则丢弃 morph(避免越界崩溃) */
+        if ((uint64_t)m->morph_vertex_base + m->morph_vertex_count > m->vertex_count) {
+            fprintf(stderr, "[r3d] MORPH 顶点范围越界(base=%u count=%u > vtx=%u)，忽略 morph\n",
+                    (unsigned)m->morph_vertex_base, (unsigned)m->morph_vertex_count, (unsigned)m->vertex_count);
+            m->morph_deltas = NULL;
+            m->morph_target_count = 0;
+            m->morph_vertex_count = 0;
+        }
     }
 
     /* ---- NODE / SKELETON / SKINVTX（可选，skin）---- */

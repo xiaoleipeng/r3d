@@ -12,7 +12,7 @@ extern "C" {
 #endif
 
 #define R3D_B3DM_MAGIC   0x4D443342u  /* 'B','3','D','M' 小端 */
-#define R3D_B3DM_VERSION 2   /* v2: submesh 20字节(+base_color_factor/node_id), 顶点+AO, NODE/SKINVTX 段 */
+#define R3D_B3DM_VERSION 3   /* v3: MORPH 段加 vertex_base(morph 顶点在合并缓冲的起始下标) */
 
 /* Header flags 位 */
 enum {
@@ -123,11 +123,15 @@ typedef struct {
 } r3d_b3dm_skeleton_t;
 
 /* ---- MORPH 段 ---- */
-/* 段开头 morph 头 + 紧随 target_count 组 delta（每组 vertex_count*3 float）*/
+/* 段开头 morph 头 + 紧随 target_count 组 delta（每组 vertex_count*3 float）。
+ * delta 仅覆盖 morph 所属 submesh 的顶点(vertex_count 个)，这些顶点在合并顶点
+ * 缓冲中从 vertex_base 开始连续排布。运行时把第 i 个 delta 加到全局顶点
+ * (vertex_base + i) 上。 */
 typedef struct {
     uint32_t target_count;
-    uint32_t vertex_count;
+    uint32_t vertex_count;    /* morph 覆盖的顶点数(= 所属 submesh 顶点数) */
     uint32_t deltas_offset;   /* float[target_count*vertex_count*3]，段内相对 */
+    uint32_t vertex_base;     /* 这些顶点在合并顶点缓冲中的起始全局下标 */
 } r3d_b3dm_morph_t;
 
 /* ---- NODE 段 ---- 每 node 一条，默认局部 TRS + 父索引 */

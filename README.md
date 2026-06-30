@@ -101,6 +101,26 @@ r3d_engine_deinit();
 相机为轨道（orbit）相机，默认自动旋转；可用 `r3d_engine_set_autospin()` /
 `r3d_engine_set_orbit()` 控制，`r3d_engine_screenshot()` 可截屏为 PPM。
 
+## 设备端 demo
+
+`r3d_vglite_demo` 直接渲染到 framebuffer。参数可以是**单个 .b3dm 文件**，
+也可以是**目录**——给目录时循环播放其中所有 `*.b3dm`，每个默认播放 30 秒后
+切换。触摸屏（`/dev/input0`）拖拽可旋转相机，触摸时暂停自旋、停手数秒后恢复。
+
+```bash
+# 单个模型
+r3d_vglite_demo /data/r3d/watch.b3dm
+
+# 目录循环播放，每个 30 秒
+r3d_vglite_demo /data/r3d
+
+# 每个模型播 15 秒、关闭自旋、指定输入设备
+r3d_vglite_demo /data/r3d -t 15 -s 0 -i /dev/input0
+```
+
+常用选项：`-d` framebuffer 设备、`-i` 触摸设备、`-f` 帧率、`-t` 每个模型秒数、
+`-s` 自旋开关、`-S` 截图路径。运行中 `kill -USR2 <pid>` 可截屏。
+
 ## 资产流程
 
 离线用 `tools/gltf2b3dm` 把 glTF 转成 B3DM，推送到设备 `/data/r3d/` 即可。

@@ -28,15 +28,22 @@ void r3d_deform_apply(r3d_deform_t *df, const r3d_model_t *m,
 
     if (!m->morph_deltas || nt==0) return;
 
-    /* 叠加每个 target 的加权 delta */
+    /* morph delta 仅覆盖 morph_vertex_count 个顶点(某 submesh)，按该长度做步长，
+     * 第 i 个 delta 加到全局顶点 (morph_vertex_base + i)。
+     * 注意：步长用 morph_vertex_count(非全模型 vc)，否则越界读崩溃。 */
+    uint32_t mvc  = m->morph_vertex_count;
+    uint32_t mbase= m->morph_vertex_base;
+    if (mvc == 0) return;
     for (uint32_t t=0; t<nt; t++){
         float w = weights[t];
         if (w==0.0f) continue;
-        const float *d = m->morph_deltas + (size_t)t*vc*3;
-        for (uint32_t i=0;i<vc;i++){
-            df->out[i].pos.x += w * d[i*3+0];
-            df->out[i].pos.y += w * d[i*3+1];
-            df->out[i].pos.z += w * d[i*3+2];
+        const float *d = m->morph_deltas + (size_t)t*mvc*3;
+        for (uint32_t i=0;i<mvc;i++){
+            uint32_t gv = mbase + i;
+            if (gv >= vc) break;   /* 防御越界 */
+            df->out[gv].pos.x += w * d[i*3+0];
+            df->out[gv].pos.y += w * d[i*3+1];
+            df->out[gv].pos.z += w * d[i*3+2];
         }
     }
 }

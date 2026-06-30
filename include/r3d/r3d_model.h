@@ -37,9 +37,13 @@ typedef struct {
 
     r3d_aabb_t     bounds;
 
-    /* morph：base 顶点即 vertices；deltas 指向 raw，[target_count*vertex_count*3] */
+    /* morph：base 顶点即 vertices；deltas 指向 raw。
+     * deltas 仅覆盖 morph_vertex_count 个顶点(某 submesh)，按 [target][vertex][xyz]
+     * 排布；第 i 个 delta 作用到全局顶点 (morph_vertex_base + i)。 */
     const float   *morph_deltas;
     uint32_t       morph_target_count;
+    uint32_t       morph_vertex_count;
+    uint32_t       morph_vertex_base;
 
     /* skin（均指向 raw）*/
     const void    *nodes;          /* r3d_b3dm_node_t[node_count] */

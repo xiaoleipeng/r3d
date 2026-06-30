@@ -322,14 +322,67 @@ int r3d_engine_deinit(void)
 static void setup_camera(r3d_anim_instance_t *a)
 {
     r3d_model_t *m = a->model;
-    float r = m->bounds.max.x - m->bounds.min.x;
-    float ry = m->bounds.max.y - m->bounds.min.y;
+
+    /* 计算“真实显示空间”的包围盒。
+     * 关键：DYNAMIC_NODE 的 submesh 顶点未烘焙节点变换，存的是量化/原始空间的
+     * 大坐标(facecap 顶点量级达数千~万)，运行时靠 node 链矩阵(含 scale)还原到
+     * 真实尺寸(~2 单位)。而 header 的 bounding_sphere 是量化/原始空间的，直接拿
+     * 来设相机会让相机对准错误位置、距离也差几个数量级 → 模型整片落在视锥外被
+     * 裁掉(现象：tri/f=0，全黑)。
+     * 故这里对每个 submesh 顶点套用其 node 矩阵(默认姿势)后再求 AABB，得到与
+     * 运行时渲染一致的真实包围盒。 */
+    float bmin[3] = { 1e30f, 1e30f, 1e30f };
+    float bmax[3] = { -1e30f, -1e30f, -1e30f };
+    int have_box = 0;
+
+    for (uint32_t s = 0; s < m->submesh_count; s++) {
+        r3d_submesh_t *sm = &m->submeshes[s];
+        r3d_mat4_t nm;
+        int dyn = (sm->mat_flags & R3D_MAT_DYNAMIC_NODE) && a->animated;
+        if (dyn) r3d_anim_node_matrix(m, &a->ast, sm->node_id, &nm);
+        else     r3d_mat4_identity(&nm);
+
+        uint32_t end = sm->index_offset + sm->index_count;
+        if (end > m->index_count) end = m->index_count;
+        for (uint32_t i = sm->index_offset; i < end; i++) {
+            uint16_t vi = m->indices[i];
+            if (vi >= m->vertex_count) continue;
+            r3d_vec3_t p = m->vertices[vi].pos;
+            float wx, wy, wz;
+            if (dyn) {
+                /* world = nm × p (列主序) */
+                wx = nm.m[0]*p.x + nm.m[4]*p.y + nm.m[8]*p.z  + nm.m[12];
+                wy = nm.m[1]*p.x + nm.m[5]*p.y + nm.m[9]*p.z  + nm.m[13];
+                wz = nm.m[2]*p.x + nm.m[6]*p.y + nm.m[10]*p.z + nm.m[14];
+            } else { wx = p.x; wy = p.y; wz = p.z; }
+            if (wx < bmin[0]) bmin[0] = wx;
+            if (wx > bmax[0]) bmax[0] = wx;
+            if (wy < bmin[1]) bmin[1] = wy;
+            if (wy > bmax[1]) bmax[1] = wy;
+            if (wz < bmin[2]) bmin[2] = wz;
+            if (wz > bmax[2]) bmax[2] = wz;
+            have_box = 1;
+        }
+    }
+
+    if (!have_box) {
+        /* 回退：用 header bounding_sphere 推得的 AABB */
+        bmin[0] = m->bounds.min.x; bmin[1] = m->bounds.min.y; bmin[2] = m->bounds.min.z;
+        bmax[0] = m->bounds.max.x; bmax[1] = m->bounds.max.y; bmax[2] = m->bounds.max.z;
+    }
+
+    /* 半径取三轴最大 extent，确保任意旋转角度都框得下(尤其 Z 方向很长的模型) */
+    float rx = bmax[0] - bmin[0];
+    float ry = bmax[1] - bmin[1];
+    float rz = bmax[2] - bmin[2];
+    float r = rx;
     if (ry > r) r = ry;
+    if (rz > r) r = rz;
     if (r < 1e-3f) r = 1.0f;
     a->radius = r;
-    a->center = (r3d_vec3_t){ (m->bounds.min.x + m->bounds.max.x) * 0.5f,
-                              (m->bounds.min.y + m->bounds.max.y) * 0.5f,
-                              (m->bounds.min.z + m->bounds.max.z) * 0.5f };
+    a->center = (r3d_vec3_t){ (bmin[0] + bmax[0]) * 0.5f,
+                              (bmin[1] + bmax[1]) * 0.5f,
+                              (bmin[2] + bmax[2]) * 0.5f };
     a->yaw = 0.0f;
     a->pitch = 0.4f;
     a->dist0 = r * 1.6f + 0.5f;
@@ -438,6 +491,13 @@ void r3d_engine_set_orbit(r3d_engine_handle handle,
     if (dist_scale > 0.0f) a->dist = a->dist0 * dist_scale;
 }
 
+void r3d_engine_set_zoom(r3d_engine_handle handle, float dist_scale)
+{
+    if (!handle || dist_scale <= 0.0f) return;
+    r3d_anim_instance_t *a = (r3d_anim_instance_t *)handle;
+    a->dist = a->dist0 * dist_scale;   /* 仅改距离，不动 yaw/pitch(不打断自旋) */
+}
+
 int r3d_engine_render_frame(r3d_engine_handle handle, float elapsed)
 {
     if (g_ctx == NULL) return R3D_ENGINE_ERR_INIT;
@@ -473,8 +533,14 @@ int r3d_engine_render_frame(r3d_engine_handle handle, float elapsed)
                        a->center.z + a->dist * cosf(a->pitch) * cosf(a->yaw) };
     r3d_camera_t cam;
     r3d_mat4_look_at(&cam.view, eye, a->center, (r3d_vec3_t){0, 1, 0});
+    /* 近/远平面按相机距离+模型半径自适应：固定 0.05/100 对大模型(如 Fox，
+     * 对角线可达 ~200)会让远端顶点超出远平面、近端跨近平面被整片丢弃 → 闪烁。
+     * 远平面留足模型对角线余量，近平面取距离的小比例但不小于 0.05。 */
+    float far_plane = a->dist + a->radius * 2.0f + 1.0f;
+    float near_plane = a->dist * 0.05f;
+    if (near_plane < 0.05f) near_plane = 0.05f;
     r3d_mat4_perspective(&cam.proj, 1.0f,
-                         (float)ctx->fb_w / (float)ctx->fb_h, 0.05f, 100.0f);
+                         (float)ctx->fb_w / (float)ctx->fb_h, near_plane, far_plane);
     cam.viewport = (r3d_viewport_t){ 0, 0, ctx->fb_w, ctx->fb_h };
 
     if (trace) R3D_TRACE("  [2] begin_frame back=%d", back);

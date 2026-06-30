@@ -256,11 +256,16 @@ static int g2b_extract(cgltf_data *d, const char *gltf_path,
     uint32_t cap = 16; sc->prims = (wprim_t*)calloc(cap, sizeof(wprim_t));
     float bmin[3]={1e30f,1e30f,1e30f}, bmax[3]={-1e30f,-1e30f,-1e30f};
 
-    /* 动态 node 集合：被动画 channel 驱动的 node 及其子孙(这些不烘焙节点变换) */
+    /* 动态 node 集合：被 T/R/S 动画 channel 驱动的 node 及其子孙(这些不烘焙节点
+     * 变换，留给运行时蒙皮/节点动画)。注意：仅被 weights(morph 权重)驱动的 node
+     * 其 TRS 仍是静态的，应照常烘焙节点变换，否则量化顶点会停留在错误尺寸/位置。 */
     unsigned char *dyn=(unsigned char*)calloc(d->nodes_count?d->nodes_count:1,1);
     int matcap_tid=-1;  /* 共享 matcap 纹理 id(去重) */
     for(size_t ai=0;ai<d->animations_count;ai++)
         for(size_t ci=0;ci<d->animations[ai].channels_count;ci++){
+            /* weights 通道不让 node 变"几何动态" */
+            if(d->animations[ai].channels[ci].target_path==cgltf_animation_path_type_weights)
+                continue;
             cgltf_node *tn=d->animations[ai].channels[ci].target_node;
             int ti=g2b_node_index(d,tn);
             if(ti>=0 && ti<(int)d->nodes_count){
@@ -305,14 +310,47 @@ static int g2b_extract(cgltf_data *d, const char *gltf_path,
             }
             if (!apos) continue;
 
+            /* Draco 压缩 prim：cgltf 不解码，accessor 指向压缩字节(读出是垃圾)。
+               用 Draco 桥接解出 float 顶点属性 + 索引，覆盖后续读取。 */
+            g2b_draco_mesh_t dm; memset(&dm,0,sizeof dm);
+            int draco_ok=0;
+            if (pr->has_draco_mesh_compression){
+                cgltf_draco_mesh_compression *dc=&pr->draco_mesh_compression;
+                int pos_id=-1,nrm_id=-1,uv_id=-1;
+                for(size_t a=0;a<dc->attributes_count;a++){
+                    /* draco unique_id 被 cgltf 存为 attributes[a].data 的 accessor 下标 */
+                    int id=(int)(dc->attributes[a].data - d->accessors);
+                    switch(dc->attributes[a].type){
+                        case cgltf_attribute_type_position: pos_id=id; break;
+                        case cgltf_attribute_type_normal:   nrm_id=id; break;
+                        case cgltf_attribute_type_texcoord: if(uv_id<0)uv_id=id; break;
+                        default: break;
+                    }
+                }
+                const uint8_t *cbuf=(const uint8_t*)cgltf_buffer_view_data(dc->buffer_view);
+                if (cbuf && g2b_draco_decode(cbuf, dc->buffer_view->size,
+                                             pos_id,nrm_id,uv_id,&dm)==0){
+                    draco_ok=1;
+                } else {
+                    if(!g2b_draco_available())
+                        fprintf(stderr,"跳过 Draco 压缩 prim(未编入 Draco 支持)\n");
+                    else
+                        fprintf(stderr,"Draco 解码失败，跳过该 prim\n");
+                    sc->prim_count--; /* 回退本 prim */
+                    continue;
+                }
+            }
+
             if (sc->prim_count==cap){cap*=2;sc->prims=(wprim_t*)realloc(sc->prims,cap*sizeof(wprim_t));}
             wprim_t *wp=&sc->prims[sc->prim_count++];
             memset(wp,0,sizeof(*wp));
             wp->node_id=(int)ni; wp->is_dynamic=is_dyn;
-            wp->vcount=(uint32_t)apos->count;
+            wp->vcount = draco_ok ? dm.vertex_count : (uint32_t)apos->count;
             wp->verts=(wvert_t*)calloc(wp->vcount,sizeof(wvert_t));
             for (uint32_t i=0;i<wp->vcount;i++){
-                float p[3]={0}; cgltf_accessor_read_float(apos,i,p,3);
+                float p[3]={0};
+                if (draco_ok && dm.position){ p[0]=dm.position[i*3];p[1]=dm.position[i*3+1];p[2]=dm.position[i*3+2]; }
+                else cgltf_accessor_read_float(apos,i,p,3);
                 if (!skinned){
                     /* bake: p' = wm(列主序) × p */
                     float x=p[0],y=p[1],z=p[2];
@@ -322,9 +360,13 @@ static int g2b_extract(cgltf_data *d, const char *gltf_path,
                 }
                 wp->verts[i].px=p[0]; wp->verts[i].py=p[1]; wp->verts[i].pz=p[2];
                 for(int k=0;k<3;k++){ if(p[k]<bmin[k])bmin[k]=p[k]; if(p[k]>bmax[k])bmax[k]=p[k]; }
-                if (auv){ float t[2]={0}; cgltf_accessor_read_float(auv,i,t,2); wp->verts[i].u=t[0]; wp->verts[i].v=t[1]; }
-                if (anrm){
-                    float nn[3]={0}; cgltf_accessor_read_float(anrm,i,nn,3);
+                if (draco_ok){
+                    if (dm.texcoord){ wp->verts[i].u=dm.texcoord[i*2]; wp->verts[i].v=dm.texcoord[i*2+1]; }
+                } else if (auv){ float t[2]={0}; cgltf_accessor_read_float(auv,i,t,2); wp->verts[i].u=t[0]; wp->verts[i].v=t[1]; }
+                if (draco_ok ? (dm.normal!=NULL) : (anrm!=NULL)){
+                    float nn[3]={0};
+                    if (draco_ok){ nn[0]=dm.normal[i*3];nn[1]=dm.normal[i*3+1];nn[2]=dm.normal[i*3+2]; }
+                    else cgltf_accessor_read_float(anrm,i,nn,3);
                     if (!skinned){
                         float x=nn[0],y=nn[1],z=nn[2];
                         nn[0]=wm[0]*x+wm[4]*y+wm[8]*z;
@@ -338,7 +380,12 @@ static int g2b_extract(cgltf_data *d, const char *gltf_path,
                 else { wp->verts[i].nz=1.0f; }
             }
             /* 索引 */
-            if (pr->indices){
+            if (draco_ok){
+                wp->icount=dm.index_count;
+                wp->idx=(uint16_t*)malloc(wp->icount*sizeof(uint16_t));
+                for(uint32_t i=0;i<wp->icount;i++) wp->idx[i]=(uint16_t)dm.indices[i];
+                g2b_draco_free(&dm);
+            } else if (pr->indices){
                 wp->icount=(uint32_t)pr->indices->count;
                 wp->idx=(uint16_t*)malloc(wp->icount*sizeof(uint16_t));
                 for(uint32_t i=0;i<wp->icount;i++) wp->idx[i]=(uint16_t)cgltf_accessor_read_index(pr->indices,i);
@@ -365,7 +412,9 @@ static int g2b_extract(cgltf_data *d, const char *gltf_path,
                 }
             }
 
-            /* morph targets: 提取每个 target 的 POSITION delta */
+            /* morph targets: 提取每个 target 的 POSITION delta。
+             * delta 是位置偏移，烘焙节点变换时需乘 wm 的线性部分(旋转+缩放，
+             * 不含平移)，与顶点保持同一空间，否则 morph 形变尺寸/方向错乱。 */
             wp->morph_count=0; wp->morph_delta=NULL;
             if (pr->targets_count>0){
                 wp->morph_count=(uint32_t)pr->targets_count;
@@ -377,9 +426,15 @@ static int g2b_extract(cgltf_data *d, const char *gltf_path,
                             pa=pr->targets[t].attributes[a].data;
                     if(!pa) continue;
                     for(uint32_t i=0;i<wp->vcount;i++){
-                        float d[3]={0}; cgltf_accessor_read_float(pa,i,d,3);
+                        float dd[3]={0}; cgltf_accessor_read_float(pa,i,dd,3);
+                        if(!skinned){
+                            float x=dd[0],y=dd[1],z=dd[2];
+                            dd[0]=wm[0]*x+wm[4]*y+wm[8]*z;   /* 线性部分，无平移 */
+                            dd[1]=wm[1]*x+wm[5]*y+wm[9]*z;
+                            dd[2]=wm[2]*x+wm[6]*y+wm[10]*z;
+                        }
                         float *dst=&wp->morph_delta[((size_t)t*wp->vcount+i)*3];
-                        dst[0]=d[0];dst[1]=d[1];dst[2]=d[2];
+                        dst[0]=dd[0];dst[1]=dd[1];dst[2]=dd[2];
                     }
                 }
             }

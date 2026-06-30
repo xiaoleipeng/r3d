@@ -58,6 +58,10 @@ void r3d_skin_update(r3d_skin_t *sk, const r3d_model_t *m, r3d_anim_state_t *st)
         for(uint32_t c=0;c<p->clip->channel_count;c++){
             const r3d_anim_chan_t *ch=&p->clip->channels[c];
             if(ch->target_node>=sk->node_count) continue;
+            /* 只处理 T/R/S；weights 通道(comp=morph 数，可能 >4)对节点 TRS 无意义，
+             * 误传给 skin_sample(v[4]) 会按 comp 写满 → 栈溢出。 */
+            if(ch->path!=R3D_ANIM_PATH_T && ch->path!=R3D_ANIM_PATH_R && ch->path!=R3D_ANIM_PATH_S)
+                continue;
             float v[4]={0}; skin_sample(ch,p->clip->fps,p->time,v);
             node_trs_t *n=&trs[ch->target_node];
             if(ch->path==R3D_ANIM_PATH_T) n->t=(r3d_vec3_t){v[0],v[1],v[2]};

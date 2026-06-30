@@ -27,6 +27,7 @@
 #include "vg_lite.h"
 
 #include <stdlib.h>
+#include <malloc.h>
 #include <string.h>
 #include <math.h>
 #include <time.h>
@@ -65,14 +66,16 @@ static long vgl_now_ms(void)
 #define VGL_COORD_LIMIT 32768.0f
 
 /* 三角形填充规则。
- * 对照 LVGL(lv_draw_vg_lite_triangle.c)：LVGL 在这块完全相同的 GPU 上画三角形
- * 用 VG_LITE_FILL_EVEN_ODD 并能正常上屏。NON_ZERO 与 EVEN_ODD 对单个简单三角形
- * 视觉结果一致，但在 tessellation 内走不同的填充/扫描分支。诊断 GPU finish 超时
- * 时，把填充规则对齐 LVGL 作为单变量实验。 */
+ * 逐三角形单独绘制，单个三角形 NON_ZERO 与 EVEN_ODD 结果一致；沿用 EVEN_ODD。 */
 #define VGL_FILL_RULE  VG_LITE_FILL_EVEN_ODD
 
-/* path 细分质量。对齐 LVGL(lv_vg_lite_path_create 用 VG_LITE_HIGH)。
- * 三角形只有直线段，quality 仅影响曲线，这里与 LVGL 保持一致。 */
+/* 周期 flush 阈值：每提交这么多次 draw 调用 flush 一次命令缓冲，
+ * 防止超大模型(上万三角形)命令缓冲溢出；帧末再统一 finish 一次。
+ * 不再每个 draw 都 flush(那是早期定位 hang 时的临时做法，开销巨大)。 */
+#define VGL_FLUSH_BATCH  64
+
+/* path 细分质量。VG_LITE_HIGH：保留三角形边缘抗锯齿，配合逐面 flat 光照
+ * 呈现曲面的明暗层次(立体感来源)。 */
 #define VGL_FILL_QUALITY  VG_LITE_HIGH
 
 /* 一个待绘制的屏幕空间三角形(投影后收集，end_frame 排序绘制) */
@@ -84,6 +87,7 @@ typedef struct {
     vg_lite_color_t color;     /* 染色/纯色(ABGR8888，VGLite 内部序) */
     int translucent;           /* 半透明：最后绘制 */
     int blend;                 /* r3d_blend_t */
+    uint32_t seq;              /* 收集顺序：深度相等时的稳定 tie-breaker(防止帧间排序抖动闪烁) */
 } vgl_tri_t;
 
 /* 纹理句柄实体：包一个 vg_lite_buffer */
@@ -266,18 +270,35 @@ static r3d_texture_handle_t vgl_create_texture(r3d_backend_t *self, const r3d_im
     vgl_tex_t *t = (vgl_tex_t *)calloc(1, sizeof(vgl_tex_t));
     if (!t) return R3D_TEXTURE_NONE;
 
-    t->buf.width  = (vg_lite_int32_t)img->w;
-    t->buf.height = (vg_lite_int32_t)img->h;
-    t->buf.format = VG_LITE_ARGB8888;   /* 与 r3d ARGB8888 一致 */
-    t->buf.tiled  = VG_LITE_LINEAR;
+    /* 纹理内存用系统堆(memalign)分配，而非 vg_lite_allocate 的 GPU 私有堆。
+     * 对照 rive_for_vglite 的 allocBufferMalloc / LVGL 的 lv_vg_lite_buffer_init：
+     * 本 SoC 是统一寻址(flat-map)，GPU 可直接 DMA 访问系统内存，故无需占用
+     * 容量有限、易 OOM 的 GPU 私有堆(256x256 纹理在私有堆常分配失败)。
+     * 关键约束：
+     *   - stride 必须 64 字节对齐(VGLite 硬件要求，同 LV_VG_LITE_BUF_ALIGN)
+     *   - 起始地址 64 字节对齐(用 memalign)
+     *   - address 直接用虚拟地址(统一寻址下 == GPU 可用地址)，handle=NULL */
+    t->buf.width            = (vg_lite_int32_t)img->w;
+    t->buf.height           = (vg_lite_int32_t)img->h;
+    t->buf.format           = VG_LITE_BGRA8888;   /* 纹理像素在 b3dm 中按 BGRA 字节序存储(见 gltf2b3dm)，与 framebuffer 同序，避免 R/B 反 */
+    t->buf.tiled            = VG_LITE_LINEAR;
+    t->buf.image_mode       = VG_LITE_NORMAL_IMAGE_MODE;
+    t->buf.transparency_mode= VG_LITE_IMAGE_OPAQUE;
+    t->buf.stride           = ((vg_lite_int32_t)img->w * 4 + 63) & ~63;  /* 64 对齐 */
+    t->buf.handle           = NULL;
 
-    vg_lite_error_t ae = vg_lite_allocate(&t->buf);
-    if (ae != VG_LITE_SUCCESS) {
-        VGL_ERR("create_texture: vg_lite_allocate(%dx%d) ret=%d(%s)",
-                (int)img->w, (int)img->h, (int)ae, vgl_err_str(ae));
+    size_t size = (size_t)t->buf.stride * img->h;
+    /* 多分配一行 stride 作为安全余量，防止 GPU 写越界(对照 rive) */
+    void *mem = memalign(64, size + t->buf.stride);
+    if (!mem) {
+        VGL_ERR("create_texture: memalign(%dx%d, %zu bytes) failed",
+                (int)img->w, (int)img->h, size + t->buf.stride);
         free(t);
         return R3D_TEXTURE_NONE;
     }
+    t->buf.memory  = mem;
+    t->buf.address = (vg_lite_uint32_t)(uintptr_t)mem;
+
     /* 拷贝像素(按行，处理 stride 差异) */
     uint32_t src_stride = img->stride ? img->stride : img->w * 4;
     uint8_t *dst = (uint8_t *)t->buf.memory;
@@ -294,7 +315,8 @@ static void vgl_destroy_texture(r3d_backend_t *self, r3d_texture_handle_t h)
     (void)self;
     vgl_tex_t *t = (vgl_tex_t *)h;
     if (t && t->valid) {
-        vg_lite_free(&t->buf);
+        /* memalign 分配，用 free 释放(非 vg_lite_free) */
+        if (t->buf.memory) free(t->buf.memory);
         free(t);
     }
 }
@@ -375,9 +397,16 @@ static void vgl_draw(r3d_backend_t *self, const r3d_mesh_t *mesh,
     uint32_t base_argb = mat->base_color_factor ? mat->base_color_factor : 0xFFFFFFFFu;
 
     for (uint32_t i = 0; i + 2 < mesh->index_count; i += 3) {
-        const r3d_vertex_t *v0 = &mesh->vertices[mesh->indices[i]];
-        const r3d_vertex_t *v1 = &mesh->vertices[mesh->indices[i+1]];
-        const r3d_vertex_t *v2 = &mesh->vertices[mesh->indices[i+2]];
+        uint32_t i0 = mesh->indices[i], i1 = mesh->indices[i+1], i2 = mesh->indices[i+2];
+        /* 防御：索引越界(损坏/不匹配的模型，如 vertex_count 远小于 index 引用)
+         * 会导致越界读垃圾内存当顶点坐标，进而 NaN/超大值喂给 GPU、看门狗复位。
+         * 越界的三角形直接跳过。 */
+        if (i0 >= mesh->vertex_count || i1 >= mesh->vertex_count ||
+            i2 >= mesh->vertex_count)
+            continue;
+        const r3d_vertex_t *v0 = &mesh->vertices[i0];
+        const r3d_vertex_t *v1 = &mesh->vertices[i1];
+        const r3d_vertex_t *v2 = &mesh->vertices[i2];
         const r3d_vertex_t *vv[3] = { v0, v1, v2 };
 
         /* 投影到裁剪空间 */
@@ -421,7 +450,9 @@ static void vgl_draw(r3d_backend_t *self, const r3d_mesh_t *mesh,
         if (fabsf(area) < 0.01f) { continue; }            /* 退化三角形 */
 
         if (im->tri_count >= im->tri_cap) { break; }
-        vgl_tri_t *T = &im->tris[im->tri_count++];
+        vgl_tri_t *T = &im->tris[im->tri_count];
+        T->seq = im->tri_count;   /* 稳定排序序号 */
+        im->tri_count++;
 
         for (int k = 0; k < 3; k++) {
             T->sx[k] = sx[k];
@@ -488,6 +519,10 @@ static int tri_cmp(const void *a, const void *b)
         return ta->translucent - tb->translucent;       /* 不透明(0)在前 */
     if (ta->depth < tb->depth) return -1;                /* 更负=更远，先画 */
     if (ta->depth > tb->depth) return 1;
+    /* 深度相等：用收集顺序做稳定 tie-breaker。qsort 非稳定排序，相等深度的
+     * 三角形相对次序帧间会变，导致前后覆盖关系跳变 → 画面闪烁。固定为 seq 序。 */
+    if (ta->seq < tb->seq) return -1;
+    if (ta->seq > tb->seq) return 1;
     return 0;
 }
 
@@ -603,8 +638,15 @@ static void vgl_end_frame(r3d_backend_t *self)
         return;
     }
 
-    /* 画家算法排序 */
+    /* 画家算法排序：远→近，半透明最后。 */
     qsort(im->tris, im->tri_count, sizeof(vgl_tri_t), tri_cmp);
+
+    /* 逐三角形绘制(保持画家算法的逐面遮挡 + 每面 flat 光照的明暗层次，
+     * 这是立体感的来源；不做"同色合批"——合批会把曲面上相邻、量化后同色的
+     * 面合成一片纯色，丢失曲率的明暗渐变，看起来变平)。
+     * 性能优化只保留"批量 flush"：不再每个 draw 都 flush，而是每
+     * VGL_FLUSH_BATCH 次 flush 一次 + 帧末统一 finish。 */
+    int pending_draws = 0;
 
     for (uint32_t i = 0; i < im->tri_count; i++) {
         vgl_tri_t *T = &im->tris[i];
@@ -613,17 +655,9 @@ static void vgl_end_frame(r3d_backend_t *self)
         if (!pp) break;
 
         /* 三角形 path 顶点数据(FP32)：MOVE/LINE/LINE/CLOSE/END = 11 个 4 字节 slot。
-         * 写入常驻缓冲 im->path_data 的第 i 段(非栈)：vg_lite_draw 异步提交，
-         * GPU 直到 finish 才读取，故数据必须存活整帧。
-         *
-         * 关键(对照 rive VGLitePath::appendOpCode / appendFloat)：
-         * 即便 path 格式是 VG_LITE_FP32，path 缓冲里每个 4 字节 slot 的解释为——
-         * opcode slot 按【uint32 整数位模式】写(如 MOVE = 字节 02 00 00 00)，
-         * 坐标 slot 按【IEEE754 float】写。
-         * 若误把 opcode 写成 (float)2.0f(位模式 0x40000000)，GPU 命令解析器会
-         * 读到非法 opcode 流，触发 tessellation 握手卡死(finish 超时)。 */
+         * opcode slot 按 uint32 整数位模式写、坐标 slot 按 IEEE754 float 写。 */
         float *pdata = &im->path_data[(size_t)i * 11];
-        uint32_t *pop = (uint32_t *)pdata;  /* 同一缓冲的 uint32 视图，用于写 opcode */
+        uint32_t *pop = (uint32_t *)pdata;
         pop[0] = (uint32_t)VLC_OP_MOVE;  pdata[1] = T->sx[0]; pdata[2] = T->sy[0];
         pop[3] = (uint32_t)VLC_OP_LINE;  pdata[4] = T->sx[1]; pdata[5] = T->sy[1];
         pop[6] = (uint32_t)VLC_OP_LINE;  pdata[7] = T->sx[2]; pdata[8] = T->sy[2];
@@ -638,13 +672,14 @@ static void vgl_end_frame(r3d_backend_t *self)
             if (T->sy[k] > maxy) maxy = T->sy[k];
         }
 
-        /* 手动填充 vg_lite_path_t —— 镜像 rive(VGLitePath::finalize)：不调用
-         * vg_lite_init_path(它会强制 path_type=FILL_PATH 并做 CLOSE→END 改写)，
-         * 只设必要字段，path_type 保持 0(VG_LITE_DRAW_ZERO)。
-         * bounding_box 与 rive 一致：直接用顶点 min/max 浮点值，不取整、不 +1。 */
         memset(pp, 0, sizeof(*pp));
         pp->format       = VG_LITE_FP32;
-        pp->quality      = VGL_FILL_QUALITY;
+        /* 纹理(pattern)三角形用 LOW(关 AA)：GPU 抗锯齿产生分数边缘覆盖率，
+         * 相邻三角形共享边各贡献部分覆盖，经 src-over 混合后不足 100%，缝隙
+         * 像素透出底色形成可见黑线(对照 rive drawImageMeshPatternFill 的结论)。
+         * 硬边(100%/0%)保证相邻三角形无缝拼接，仅外轮廓略锯齿。
+         * 纯色三角形无此问题，保留 HIGH 以获得更平滑边缘/立体感。 */
+        pp->quality      = T->tex ? VG_LITE_LOW : VGL_FILL_QUALITY;
         pp->path         = pdata;
         pp->path_length  = (vg_lite_uint32_t)(11 * sizeof(uint32_t));
         pp->path_changed = 1;
@@ -654,7 +689,7 @@ static void vgl_end_frame(r3d_backend_t *self)
         pp->bounding_box[3] = maxy;
 
         vg_lite_matrix_t path_mat;
-        vg_lite_identity(&path_mat);  /* 屏幕坐标已是最终位置 */
+        vg_lite_identity(&path_mat);
 
         vg_lite_blend_t blend = to_vgl_blend(T->blend, T->translucent);
 
@@ -663,9 +698,8 @@ static void vgl_end_frame(r3d_backend_t *self)
             vg_lite_matrix_t pat_mat;
             if (solve_affine(T, T->tex->width, T->tex->height, &pat_mat)) {
                 derr = vg_lite_draw_pattern(&im->target, pp, VGL_FILL_RULE,
-                                     &path_mat, T->tex, &pat_mat,
-                                     blend, VG_LITE_PATTERN_PAD,
-                                     0, T->color, VG_LITE_FILTER_BI_LINEAR);
+                             &path_mat, T->tex, &pat_mat, blend,
+                             VG_LITE_PATTERN_PAD, 0, T->color, VG_LITE_FILTER_BI_LINEAR);
                 im->tex_binds++;
             } else {
                 derr = vg_lite_draw(&im->target, pp, VGL_FILL_RULE,
@@ -676,7 +710,6 @@ static void vgl_end_frame(r3d_backend_t *self)
                          &path_mat, blend, T->color);
         }
         if (derr != VG_LITE_SUCCESS) {
-            /* draw 失败：中止本帧绘制循环，走到末尾 finish 把已入队命令落地。 */
             VGL_ERR("tri[%u] %s ret=%d(%s), abort frame", (unsigned)i,
                     T->tex ? "vg_lite_draw_pattern" : "vg_lite_draw",
                     (int)derr, vgl_err_str(derr));
@@ -684,11 +717,11 @@ static void vgl_end_frame(r3d_backend_t *self)
         }
         im->draw_calls++;
 
-        /* 每个 draw 后 flush —— 对齐 rive flushIfNeeded：把命令缓冲正式提交、
-         * 开新缓冲，使帧末 finish 能正确 arm 等待完成中断(否则 finish 超时)。 */
-        vg_lite_error_t fe = vg_lite_flush();
-        if (fe != VG_LITE_SUCCESS)
-            VGL_ERR("vg_lite_flush ret=%d(%s)", (int)fe, vgl_err_str(fe));
+        /* 批量 flush：每 VGL_FLUSH_BATCH 次 draw flush 一次(不再每个 draw 都 flush)。 */
+        if (++pending_draws >= VGL_FLUSH_BATCH) {
+            vg_lite_flush();
+            pending_draws = 0;
+        }
     }
 
     vg_lite_error_t fe = vg_lite_finish();

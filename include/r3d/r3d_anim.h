@@ -12,7 +12,7 @@ extern "C" {
 #endif
 
 #define R3D_MAX_PLAYERS 4
-#define R3D_MAX_MORPH   8
+#define R3D_MAX_MORPH   64   /* 支持 ARKit 52 套 blendshape 等(facecap)，留余量 */
 
 typedef struct {
     uint16_t      target_node;

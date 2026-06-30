@@ -125,10 +125,13 @@ void r3d_anim_update(r3d_anim_state_t *st, float dt){
         for(uint32_t c=0;c<p->clip->channel_count;c++){
             const r3d_anim_chan_t *ch=&p->clip->channels[c];
             if(ch->path==R3D_ANIM_PATH_W){
-                /* morph 权重通道：comp = target 数 */
+                /* morph 权重通道：comp = target 数。
+                 * 防御：sample_chan 会按 ch->comp 写满 out，若 comp 超过缓冲会栈溢出，
+                 * 故用一份 clamp 后的临时通道，绝不写超过 R3D_MAX_MORPH。 */
                 float mw[R3D_MAX_MORPH]={0};
                 uint32_t cn = ch->comp<R3D_MAX_MORPH?ch->comp:R3D_MAX_MORPH;
-                sample_chan(ch,p->clip->fps,p->time,mw);
+                r3d_anim_chan_t cch=*ch; cch.comp=(uint8_t)cn;
+                sample_chan(&cch,p->clip->fps,p->time,mw);
                 for(uint32_t k=0;k<cn;k++) morph_acc[k]+=mw[k]*w;
                 if(cn>morph_n) morph_n=cn;
                 continue;
@@ -174,6 +177,10 @@ static void node_local_matrix(const r3d_b3dm_node_t *bn, r3d_anim_state_t *st,
         for(uint32_t c=0;c<p->clip->channel_count;c++){
             const r3d_anim_chan_t *ch=&p->clip->channels[c];
             if(ch->target_node!=nid) continue;
+            /* 只处理 T/R/S；weights 通道驱动的是 morph(comp=morph 数，可能远大于 4)，
+             * 对节点矩阵无意义，且若误传给 sample_chan(v[4]) 会按 comp 写满 → 栈溢出。 */
+            if(ch->path!=R3D_ANIM_PATH_T && ch->path!=R3D_ANIM_PATH_R && ch->path!=R3D_ANIM_PATH_S)
+                continue;
             float v[4]={0}; sample_chan(ch,p->clip->fps,p->time,v);
             if(ch->path==R3D_ANIM_PATH_T) t=(r3d_vec3_t){v[0],v[1],v[2]};
             else if(ch->path==R3D_ANIM_PATH_S) s=(r3d_vec3_t){v[0],v[1],v[2]};
