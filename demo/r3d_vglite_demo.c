@@ -367,7 +367,9 @@ int main(int argc, FAR char *argv[])
     const char *screenshot_path = "/data/r3d_shot.ppm";
     int   target_fps = CONFIG_R3D_VGLITE_DEMO_DEFAULT_FPS;
     float secs_per_model = DEFAULT_SECS_PER_MODEL;
-    int   autospin = 1;
+    int   autospin = 0;   /* 默认关闭相机自旋：只做面部 morph 动画、相机固定，
+                           * 便于隔离评估合批可行性(色彩变化仅来自 morph，不含视角变化)。
+                           * 需要自旋时用 -s 1 开启。 */
     int   ret;
 
     if (argc < 2) {

@@ -55,6 +55,20 @@ extern void gpu_init(void);
 #define R3D_TRACE(fmt, ...) \
     syslog(LOG_INFO, "%s: " fmt "\n", LOG_TAG, ##__VA_ARGS__)
 
+/* 性能日志：每秒一次输出 CPU 顶点变形(morph/skin)耗时。
+ * 后端(backend_vglite)已统计 collect/sort/submit/gpu；这里补齐变形阶段，
+ * 让 morph 动画的完整 CPU 链路(变形→收集→提交)都可量化。 */
+#define R3D_PERF(fmt, ...) \
+    syslog(LOG_INFO, "%s: " fmt "\n", LOG_TAG, ##__VA_ARGS__)
+
+/* 单调微秒，用于阶段计时 */
+static long r3d_now_us(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long)(ts.tv_sec * 1000000L + ts.tv_nsec / 1000);
+}
+
 /****************************************************************************
  * 引擎上下文
  ****************************************************************************/
@@ -81,6 +95,12 @@ typedef struct {
 
     /* 帧计数(用于限制前几帧的详细日志) */
     uint32_t            frame_no;
+
+    /* CPU 顶点变形(morph/skin)耗时秒窗口统计(微秒) */
+    long                perf_window_us;   /* 窗口起点 */
+    uint32_t            perf_frames;      /* 窗口内帧数 */
+    uint64_t            perf_deform_sum;  /* 变形累计耗时 */
+    uint32_t            perf_deform_max;  /* 变形单帧峰值 */
 
     /* 渲染后端 */
     r3d_backend_t      *be;
@@ -557,18 +577,59 @@ int r3d_engine_render_frame(r3d_engine_handle handle, float elapsed)
     /* 顶点变形：skin 优先于 morph */
     const r3d_vertex_t *verts = m->vertices;
     int dynamic = 0;
+    long deform_us = 0;                  /* 本帧 CPU 变形耗时(morph/skin) */
     if (a->has_skin) {
         if (trace) R3D_TRACE("  [4] skin_update");
+        long t0 = r3d_now_us();
         r3d_skin_update(&a->skin, m, &a->ast);
+        deform_us = r3d_now_us() - t0;
         verts = a->skin.out;
         r3d_mat4_identity(&model);
         dynamic = 1;
     } else if (a->has_morph) {
         if (trace) R3D_TRACE("  [4] deform_apply");
+        long t0 = r3d_now_us();
         r3d_deform_apply(&a->deform, m, a->ast.morph_weights, a->ast.morph_weight_count);
+        deform_us = r3d_now_us() - t0;
         verts = a->deform.out;
         dynamic = 1;
     }
+
+    /* CPU 变形耗时每秒汇总一次(morph 动画的关键 CPU 成本之一)。 */
+    {
+        ctx->perf_frames++;
+        ctx->perf_deform_sum += (uint64_t)(deform_us < 0 ? 0 : deform_us);
+        if ((uint32_t)deform_us > ctx->perf_deform_max)
+            ctx->perf_deform_max = (uint32_t)deform_us;
+        long pnow = r3d_now_us();
+        if (ctx->perf_window_us == 0) ctx->perf_window_us = pnow;
+        if (pnow - ctx->perf_window_us >= 1000000L && ctx->perf_frames > 0) {
+            R3D_PERF("perf-cpu(us): deform avg=%u max=%u over %u frames (%s)",
+                     (unsigned)(ctx->perf_deform_sum / ctx->perf_frames),
+                     (unsigned)ctx->perf_deform_max, (unsigned)ctx->perf_frames,
+                     a->has_skin ? "skin" : (a->has_morph ? "morph" : "static"));
+            /* deform 细分诊断：定位 37ms 根因——是 target 多(计算量)还是
+             * reset/accum 分段哪个贵(cache)。仅 morph 路径有意义。 */
+            if (a->has_morph) {
+                R3D_PERF("perf-deform: targets=%u active=%u morph_verts=%u "
+                         "reset=%uus accum=%uus (last frame)",
+                         (unsigned)a->deform.stat_targets,
+                         (unsigned)a->deform.stat_active,
+                         (unsigned)a->deform.stat_morph_verts,
+                         (unsigned)a->deform.stat_reset_us,
+                         (unsigned)a->deform.stat_accum_us);
+            }
+            ctx->perf_window_us = pnow;
+            ctx->perf_frames = 0;
+            ctx->perf_deform_sum = 0;
+            ctx->perf_deform_max = 0;
+        }
+    }
+
+    /* 把引擎侧测得的变形耗时喂给后端，并入后端统一的逐帧原始性能记录与串口转储。
+     * 后端不支持时该指针为 NULL，判空跳过。 */
+    if (ctx->be->vt->perf_frame_mark)
+        ctx->be->vt->perf_frame_mark(ctx->be, deform_us);
 
     /* 两趟：先不透明，后半透明 */
     uint32_t submitted = 0;

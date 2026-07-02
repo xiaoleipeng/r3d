@@ -61,6 +61,13 @@ typedef struct r3d_backend_vtable {
 
     /* 能力查询 */
     bool (*query_feature)(r3d_backend_t *self, r3d_feature_t feat);
+
+    /* 性能：由引擎在每帧顶点变形后调用，把引擎侧测得的 CPU 变形耗时
+     * (morph/skin，微秒)喂给后端，使其并入后端统一的逐帧原始性能记录与
+     * 串口转储。可选，后端不支持则置 NULL；引擎调用前需判空。
+     * 约定：应在 begin_frame 之后、end_frame 之前调用；end_frame 消费该值
+     * 写入当前帧记录，随后清零。 */
+    void (*perf_frame_mark)(r3d_backend_t *self, long deform_us);
 } r3d_backend_vtable_t;
 
 struct r3d_backend {

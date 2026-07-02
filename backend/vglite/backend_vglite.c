@@ -52,6 +52,51 @@ static long vgl_now_ms(void)
     return (long)(ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
 }
 
+/* 返回当前单调微秒，用于帧内各阶段细粒度计时(性能剖析)。
+ * clock_gettime 单次开销 ~亚微秒，每帧仅 ~6 次，对 60fps 预算可忽略。 */
+static long vgl_now_us(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long)(ts.tv_sec * 1000000L + ts.tv_nsec / 1000);
+}
+
+/* 单个耗时指标的窗口聚合(微秒)：求和(算平均) + 最小/最大。 */
+typedef struct {
+    uint64_t sum;
+    uint32_t min, max;
+} vgl_timestat_t;
+
+static void vgl_ts_reset(vgl_timestat_t *s)
+{
+    s->sum = 0;
+    s->min = 0xFFFFFFFFu;
+    s->max = 0;
+}
+
+static void vgl_ts_add(vgl_timestat_t *s, long us)
+{
+    if (us < 0) us = 0;
+    s->sum += (uint64_t)us;
+    if ((uint32_t)us < s->min) s->min = (uint32_t)us;
+    if ((uint32_t)us > s->max) s->max = (uint32_t)us;
+}
+
+/* 原始逐帧记录：单帧各阶段测量值(微秒)与三角形计数。定长、可平凡拷贝，
+ * 存入环形缓冲，每 N 秒批量转储到串口供离线工具分析。字段顺序与转储
+ * 行的字段顺序、离线工具解析顺序三者必须保持一致。 */
+typedef struct {
+    uint32_t frame;        /* 全局帧序号(单调递增) */
+    uint32_t t_frame;      /* 整帧 CPU 墙钟 */
+    uint32_t gpu;          /* vg_lite_finish 等待 GPU */
+    uint32_t deform;       /* 引擎侧 CPU 变形(morph/skin)，经 perf_frame_mark 传入 */
+    uint32_t collect;      /* vgl_draw 收集累计 */
+    uint32_t sort;         /* 画家算法排序 */
+    uint32_t submit;       /* 命令缓冲构建 */
+    uint32_t tris;         /* 提交绘制三角形数(kept) */
+    uint32_t drawcalls;    /* draw call 次数 */
+} vgl_raw_rec_t;
+
 /* ---------------- 内部数据 ---------------- */
 
 #define VGL_MAX_TRIS_DEFAULT  20000
@@ -78,6 +123,26 @@ static long vgl_now_ms(void)
  * 呈现曲面的明暗层次(立体感来源)。 */
 #define VGL_FILL_QUALITY  VG_LITE_HIGH
 
+/* ---- 原始逐帧性能采集(Raw_Frame_Record + 环形缓冲 + 定期串口转储) ----
+ * 架构：固件只做"低开销采集 + 每 N 秒批量转储原始逐帧数据到串口"，
+ * 所有重统计(p50/p95/p99、1%/0.1% low、标准差、抖动、直方图)交由主机侧
+ * 离线工具(tools/perf/r3d_perf_analyze.py)在长采集上以全保真度计算。
+ * 默认启用、始终生效，参数为下列固定编译期常量，不经 Kconfig 配置。 */
+#define VGL_PERF_DUMP_PERIOD_SEC  5           /* 转储周期 N(秒) */
+#define VGL_PERF_RING_FRAMES      512         /* 环形缓冲帧数(>= N*60fps=300，留余量) */
+#define VGL_PERF_BUDGET_US        16667       /* 60fps 单帧预算(微秒) */
+/* 转储日志前缀：离线工具据此从混合串口流中 grep 原始行。
+ *   头部行： r3d_perfraw: HDR ...
+ *   逐帧行： r3d_perfraw: F <字段...> */
+#define VGL_PERF_RAW_TAG          "r3d_perfraw"
+
+/* 合批潜力分析：对若干感知量化档(每通道右移位数)，统计"若把画家序中相邻、
+ * 量化后同色的 tex=0 三角形合并为一次 draw，则本帧实际 draw call 数"。
+ * 只统计不改绘制，用于评估合批收益上限。shift 越大量化越粗、合批越狠。
+ * 每通道 step = 1<<shift（shift=1→128级/通道，4→16级/通道）。 */
+#define VGL_BATCH_NLEVELS  4
+static const uint8_t VGL_BATCH_SHIFT[VGL_BATCH_NLEVELS] = { 1, 2, 3, 4 };
+
 /* 一个待绘制的屏幕空间三角形(投影后收集，end_frame 排序绘制) */
 typedef struct {
     float sx[3], sy[3];        /* 屏幕坐标 */
@@ -95,6 +160,19 @@ typedef struct {
     vg_lite_buffer_t buf;
     int valid;
 } vgl_tex_t;
+
+/* 逐顶点变换缓存项(优化 #4)：同一顶点在一个 submesh 内被多个三角形共享，
+ * 原实现每个面都重算投影/法线变换。改为每个 vgl_draw 内每顶点只算一次，
+ * 面阶段直接查表。用 epoch 戳(vcache_gen)标记有效性，避免每次清空整表，
+ * 也只计算被本 submesh 引用到的顶点。 */
+typedef struct {
+    float   sx, sy;        /* 屏幕坐标 */
+    float   vz;            /* view 空间深度 */
+    float   mvn[3];        /* MV 变换后的法线(光照用) */
+    float   vn[3];         /* VIEW 变换后的法线(matcap 用；非 matcap 不填) */
+    uint8_t behind;        /* 裁剪空间 w <= 阈值(近平面前/相机后) */
+    uint8_t bad;           /* 屏幕坐标 NaN/Inf/超限 */
+} vgl_vcache_t;
 
 typedef struct {
     /* 帧目标 */
@@ -117,6 +195,18 @@ typedef struct {
     vgl_tri_t *tris;
     uint32_t   tri_count, tri_cap;
 
+    /* 逐顶点变换缓存(优化 #4)：按 mesh->vertex_count 分配，跨 submesh/帧复用。
+     * vcache_gen 为 epoch 戳，vcache_stamp[v]==vcache_gen 表示该顶点本轮已算。 */
+    vgl_vcache_t *vcache;
+    uint32_t     *vcache_stamp;
+    uint32_t      vcache_cap;    /* 已分配容量(顶点数) */
+    uint32_t      vcache_gen;    /* 当前 epoch，每次 vgl_draw 递增 */
+
+    /* 排序索引(优化 #3)：qsort 排序索引而非 80 字节的 vgl_tri_t，
+     * 交换只动 4 字节，避免大结构体拷贝。 */
+    uint32_t *sort_idx;
+    uint32_t  sort_idx_cap;
+
     /* 帧内 vg_lite_path_t 数组：每三角形一个，存活到帧末 finish。
      * 对齐 rive_for_vglite 做法：不调用 vg_lite_upload_path，path 顶点数据
      * 由 vg_lite_draw 编入主命令缓冲提交，GPU 随命令流读取。
@@ -134,6 +224,19 @@ typedef struct {
     uint32_t tex_binds;        /* 本帧纹理绑定次数(draw_pattern) */
     uint32_t frame_no;         /* 帧计数 */
 
+    /* ---- collect 阶段每帧剔除计数(begin_frame 清零，vgl_draw 累加) ----
+     * 用于分析 morph 姿态变化下三角形的输入/剔除分布：
+     *   input     = 送入 collect 的候选三角形总数(index_count/3 之和)
+     *   c_oob     = 索引越界丢弃(损坏模型)
+     *   c_behind  = 任一顶点在近平面前/相机后丢弃(w 阈值)
+     *   c_bad     = 透视除法后 NaN/Inf 或坐标超限丢弃
+     *   c_back    = 背面剔除(有向面积，非双面)
+     *   c_degen   = 退化三角形(面积近 0)
+     *   c_capped  = 三角形队列已满被丢弃(tri_cap 不足)
+     * kept(实际入队) = tri_count，已由 tri/f 反映。 */
+    uint32_t cull_input;
+    uint32_t cull_oob, cull_behind, cull_bad, cull_back, cull_degen, cull_capped;
+
     /* ---- 每秒性能统计窗口(行业标准 3D 指标) ---- */
     long     stat_window_ms;   /* 当前统计窗口起始时刻 */
     uint32_t stat_frames;      /* 窗口内帧数 */
@@ -146,6 +249,39 @@ typedef struct {
     /* 纹理绑定次数 */
     uint64_t stat_tex_sum;
     uint32_t stat_tex_min, stat_tex_max;
+
+    /* ---- 帧内各阶段耗时(微秒，end_frame 汇总进秒窗口) ----
+     * 用于定位 VGLite 后端瓶颈：CPU 收集/排序/命令构建 vs GPU 实际填充。
+     * t_collect : begin_frame→end_frame 间 vgl_draw 累计(投影+光照+收集三角形)
+     * t_sort    : 画家算法 qsort
+     * t_submit  : 逐三角形构建 path + vg_lite_draw/draw_pattern 入命令缓冲(不含 GPU 等待)
+     * t_gpu     : vg_lite_finish 阻塞等待 GPU 完成填充(真正的 GPU 墙钟)
+     * t_frame   : begin_frame→end_frame 整帧 CPU 墙钟 */
+    long          collect_us_accum;  /* 本帧 vgl_draw 累计(begin_frame 清零) */
+    long          frame_begin_us;    /* begin_frame 时刻(算整帧墙钟) */
+    vgl_timestat_t st_collect, st_sort, st_submit, st_gpu, st_frame;
+
+    /* ---- collect 剔除计数的秒窗口累加(算每帧平均) ---- */
+    uint64_t stat_cull_input_sum, stat_cull_oob_sum, stat_cull_behind_sum,
+             stat_cull_bad_sum, stat_cull_back_sum, stat_cull_degen_sum,
+             stat_cull_capped_sum;
+
+    /* ---- Deadline-Miss 秒窗口统计(基于 t_frame vs 预算) ---- */
+    uint32_t stat_miss_count;   /* 窗口内超预算帧数 */
+    uint32_t stat_worst_over;   /* 窗口内最坏超出量(微秒) */
+
+    /* ---- 合批潜力秒窗口统计：各量化档下"合批后 draw call"的累加(算每帧均值) ---- */
+    uint64_t stat_batch_sum[VGL_BATCH_NLEVELS];
+
+    /* ---- 引擎经 perf_frame_mark 传入的当帧变形耗时(end_frame 消费后清零) ---- */
+    long     deform_us_pending;
+
+    /* ---- 原始逐帧采集：环形缓冲 + 定期串口转储 ---- */
+    vgl_raw_rec_t *raw_ring;        /* 定长环形缓冲(init 一次性分配) */
+    uint32_t       raw_head;        /* 下一写入位置 */
+    uint32_t       raw_filled;      /* 已写入帧数(封顶 VGL_PERF_RING_FRAMES) */
+    long           raw_dump_ms;     /* 上次转储时刻(毫秒窗口计时) */
+    uint32_t       global_frame;    /* 全局帧序号 */
 } vgl_impl_t;
 
 /* ---------------- 工具 ---------------- */
@@ -224,6 +360,17 @@ static r3d_result_t vgl_init(r3d_backend_t *self, const r3d_backend_cfg_t *cfg)
     if (!im->tris) { return R3D_ERR_NO_MEM; }
     im->tri_count = 0;
 
+    /* 排序索引(优化 #3)：与三角形队列同容量，一次性分配。 */
+    im->sort_idx = (uint32_t *)malloc(sizeof(uint32_t) * cap);
+    if (!im->sort_idx) { free(im->tris); im->tris = NULL; return R3D_ERR_NO_MEM; }
+    im->sort_idx_cap = cap;
+
+    /* 逐顶点变换缓存(优化 #4)：容量在首次 vgl_draw 按 mesh 顶点数惰性分配。 */
+    im->vcache = NULL;
+    im->vcache_stamp = NULL;
+    im->vcache_cap = 0;
+    im->vcache_gen = 0;
+
     r3d_light_params_default(&im->light);   /* 光照默认参数(中性外观) */
 
     /* 每三角形一个 vg_lite_path_t + 一段 11 float 的 path 数据(存活到帧末 finish) */
@@ -247,6 +394,20 @@ static r3d_result_t vgl_init(r3d_backend_t *self, const r3d_backend_cfg_t *cfg)
     /* 性能统计窗口初始化 */
     im->stat_window_ms = vgl_now_ms();
     im->stat_tris_min = im->stat_dc_min = im->stat_tex_min = 0xFFFFFFFFu;
+    vgl_ts_reset(&im->st_collect);
+    vgl_ts_reset(&im->st_sort);
+    vgl_ts_reset(&im->st_submit);
+    vgl_ts_reset(&im->st_gpu);
+    vgl_ts_reset(&im->st_frame);
+
+    /* 原始逐帧采集环形缓冲：init 一次性分配，逐帧 O(1) 覆盖写入，
+     * destroy 统一释放，逐帧路径不再分配。 */
+    im->raw_ring = (vgl_raw_rec_t *)calloc(VGL_PERF_RING_FRAMES, sizeof(vgl_raw_rec_t));
+    /* 分配失败不致命：仅禁用原始采集，其余统计照常。 */
+    im->raw_head = im->raw_filled = 0;
+    im->raw_dump_ms = vgl_now_ms();
+    im->global_frame = 0;
+    im->deform_us_pending = 0;
 
     return R3D_OK;
 }
@@ -259,6 +420,10 @@ static void vgl_destroy(r3d_backend_t *self)
         free(im->tris);
         free(im->vgpaths);
         free(im->path_data);
+        free(im->raw_ring);
+        free(im->sort_idx);
+        free(im->vcache);
+        free(im->vcache_stamp);
         /* GPU 由 gpu_init 拥有，本后端不调用 vg_lite_close。 */
         free(im);
     }
@@ -334,6 +499,11 @@ static void vgl_begin_frame(r3d_backend_t *self, const r3d_target_t *target)
     im->tri_count = 0;
     im->draw_calls = 0;
     im->tex_binds = 0;
+    im->collect_us_accum = 0;          /* 本帧 vgl_draw 累计耗时清零 */
+    im->frame_begin_us = vgl_now_us(); /* 整帧 CPU 墙钟起点 */
+    im->cull_input = 0;
+    im->cull_oob = im->cull_behind = im->cull_bad = 0;
+    im->cull_back = im->cull_degen = im->cull_capped = 0;
 
     if (!target) return;
 
@@ -390,11 +560,57 @@ static void vgl_set_lighting(r3d_backend_t *self, const r3d_light_params_t *lp)
 
 /* ---------------- 绘制(收集三角形) ---------------- */
 
+/* 计算/获取一个顶点的变换缓存(优化 #4)。首次(本 epoch)计算并写入缓存，
+ * 后续三角形共享同一顶点时直接命中，避免重复的投影/法线矩阵乘法。
+ * need_view_normal：matcap 需要 VIEW 空间法线，非 matcap 跳过以省一次矩阵乘。 */
+static vgl_vcache_t *vgl_vtx(vgl_impl_t *im, const r3d_mesh_t *mesh, uint32_t vi,
+                             const r3d_mat4_t *mvp, const r3d_mat4_t *mv,
+                             int need_view_normal)
+{
+    vgl_vcache_t *vc = &im->vcache[vi];
+    if (im->vcache_stamp[vi] == im->vcache_gen)
+        return vc;   /* 本 epoch 已算，命中 */
+    im->vcache_stamp[vi] = im->vcache_gen;
+
+    const r3d_vertex_t *v = &mesh->vertices[vi];
+
+    /* 裁剪空间 + 透视除法 → 屏幕 */
+    r3d_vec4_t c = mul_mv(mvp, v->pos.x, v->pos.y, v->pos.z, 1.0f);
+    if (c.w <= VGL_W_EPSILON) {
+        vc->behind = 1; vc->bad = 0;
+        return vc;
+    }
+    vc->behind = 0;
+    float inv = 1.0f / c.w;
+    float ndc_x = c.x * inv, ndc_y = c.y * inv;
+    vc->sx = (ndc_x * 0.5f + 0.5f) * im->vp_w;
+    vc->sy = (1.0f - (ndc_y * 0.5f + 0.5f)) * im->vp_h;   /* Y 翻转 */
+    vc->bad = (!isfinite(vc->sx) || !isfinite(vc->sy) ||
+               fabsf(vc->sx) > VGL_COORD_LIMIT || fabsf(vc->sy) > VGL_COORD_LIMIT);
+
+    /* view 空间深度(排序用) */
+    r3d_vec4_t p = mul_mv(mv, v->pos.x, v->pos.y, v->pos.z, 1.0f);
+    vc->vz = p.z;
+
+    /* MV 法线(光照用) */
+    r3d_vec4_t n = mul_mv(mv, v->normal.x, v->normal.y, v->normal.z, 0.0f);
+    vc->mvn[0] = n.x; vc->mvn[1] = n.y; vc->mvn[2] = n.z;
+
+    /* VIEW 法线(仅 matcap) */
+    if (need_view_normal) {
+        r3d_vec4_t nv = mul_mv(&im->view, v->normal.x, v->normal.y, v->normal.z, 0.0f);
+        vc->vn[0] = nv.x; vc->vn[1] = nv.y; vc->vn[2] = nv.z;
+    }
+    return vc;
+}
+
 static void vgl_draw(r3d_backend_t *self, const r3d_mesh_t *mesh,
                      const r3d_mat4_t *model, const r3d_material_t *mat)
 {
     vgl_impl_t *im = (vgl_impl_t *)self->impl;
     if (!mesh || !mesh->vertices || !mesh->indices) return;
+
+    long draw_t0 = vgl_now_us();   /* 本次 draw 收集耗时计时起点 */
 
     r3d_mat4_t mvp;
     r3d_mat4_mul(&mvp, &im->view_proj, model);  /* MVP = VP * M */
@@ -408,62 +624,64 @@ static void vgl_draw(r3d_backend_t *self, const r3d_mesh_t *mesh,
                                   : (vgl_tex_t *)mat->base_color;
     uint32_t base_argb = mat->base_color_factor ? mat->base_color_factor : 0xFFFFFFFFu;
 
+    /* 逐顶点缓存(优化 #4)：确保容量覆盖本 mesh 顶点数，递增 epoch 使旧标记失效。
+     * 分配失败则回退(vcache=NULL)，下方按无缓存路径逐面直算，保证功能不受影响。 */
+    if (im->vcache_cap < mesh->vertex_count) {
+        free(im->vcache); free(im->vcache_stamp);
+        im->vcache = (vgl_vcache_t *)malloc(sizeof(vgl_vcache_t) * mesh->vertex_count);
+        im->vcache_stamp = (uint32_t *)calloc(mesh->vertex_count, sizeof(uint32_t));
+        im->vcache_cap = (im->vcache && im->vcache_stamp) ? mesh->vertex_count : 0;
+        if (!im->vcache_cap) { free(im->vcache); free(im->vcache_stamp);
+                               im->vcache = NULL; im->vcache_stamp = NULL; }
+    }
+    int use_cache = (im->vcache_cap >= mesh->vertex_count);
+    if (use_cache) {
+        im->vcache_gen++;
+        if (im->vcache_gen == 0) {  /* epoch 回绕：清 stamp 重来(极罕见) */
+            memset(im->vcache_stamp, 0, sizeof(uint32_t) * im->vcache_cap);
+            im->vcache_gen = 1;
+        }
+    }
+
     for (uint32_t i = 0; i + 2 < mesh->index_count; i += 3) {
-        uint32_t i0 = r3d_index_at(mesh->indices, mesh->index_size, i),
-                 i1 = r3d_index_at(mesh->indices, mesh->index_size, i+1),
-                 i2 = r3d_index_at(mesh->indices, mesh->index_size, i+2);
-        /* 防御：索引越界(损坏/不匹配的模型，如 vertex_count 远小于 index 引用)
-         * 会导致越界读垃圾内存当顶点坐标，进而 NaN/超大值喂给 GPU、看门狗复位。
-         * 越界的三角形直接跳过。 */
-        if (i0 >= mesh->vertex_count || i1 >= mesh->vertex_count ||
-            i2 >= mesh->vertex_count)
-            continue;
-        const r3d_vertex_t *v0 = &mesh->vertices[i0];
-        const r3d_vertex_t *v1 = &mesh->vertices[i1];
-        const r3d_vertex_t *v2 = &mesh->vertices[i2];
+        im->cull_input++;   /* 候选三角形计数(剔除前) */
+        uint32_t idx3[3] = {
+            r3d_index_at(mesh->indices, mesh->index_size, i),
+            r3d_index_at(mesh->indices, mesh->index_size, i+1),
+            r3d_index_at(mesh->indices, mesh->index_size, i+2)
+        };
+        /* 防御：索引越界(损坏/不匹配的模型)会越界读垃圾内存当顶点坐标。 */
+        if (idx3[0] >= mesh->vertex_count || idx3[1] >= mesh->vertex_count ||
+            idx3[2] >= mesh->vertex_count)
+            { im->cull_oob++; continue; }
+        const r3d_vertex_t *v0 = &mesh->vertices[idx3[0]];
+        const r3d_vertex_t *v1 = &mesh->vertices[idx3[1]];
+        const r3d_vertex_t *v2 = &mesh->vertices[idx3[2]];
         const r3d_vertex_t *vv[3] = { v0, v1, v2 };
 
-        /* 投影到裁剪空间 */
-        r3d_vec4_t c[3];
+        /* 取三个顶点的变换缓存(命中则不重算)。 */
+        vgl_vcache_t *vc[3];
         int behind = 0;
         for (int k = 0; k < 3; k++) {
-            c[k] = mul_mv(&mvp, vv[k]->pos.x, vv[k]->pos.y, vv[k]->pos.z, 1.0f);
-            if (c[k].w <= VGL_W_EPSILON) behind = 1;
+            vc[k] = vgl_vtx(im, mesh, idx3[k], &mvp, &mv, use_matcap);
+            if (vc[k]->behind) behind = 1;
         }
-        if (behind) { continue; }  /* 简化：整三角形任一顶点在近平面前/相机后则丢弃。
-                                * 注：无近平面裁剪，靠较保守的 w 阈值 + 屏幕坐标
-                                * 范围检查共同防止超大坐标喂给 GPU tessellation。 */
-        /* view 空间线性深度(用于画家算法排序，比 NDC z 更稳健) */
-        float vz[3];
-        for (int k = 0; k < 3; k++) {
-            r3d_vec4_t p = mul_mv(&mv, vv[k]->pos.x, vv[k]->pos.y, vv[k]->pos.z, 1.0f);
-            vz[k] = p.z;  /* 相机看 -z：越负越远 */
-        }
+        if (behind) { im->cull_behind++; continue; }
 
-        /* 透视除法 → NDC → 屏幕 */
-        float sx[3], sy[3];
+        float sx[3], sy[3], vz[3];
         int bad = 0;
         for (int k = 0; k < 3; k++) {
-            float inv = 1.0f / c[k].w;
-            float ndc_x = c[k].x * inv;
-            float ndc_y = c[k].y * inv;
-            sx[k] = (ndc_x * 0.5f + 0.5f) * im->vp_w;
-            sy[k] = (1.0f - (ndc_y * 0.5f + 0.5f)) * im->vp_h; /* Y 翻转 */
-            /* 防御：NaN/Inf(坏顶点数据)或超大坐标会让 tessellation 跑飞 hang */
-            if (!isfinite(sx[k]) || !isfinite(sy[k]) ||
-                fabsf(sx[k]) > VGL_COORD_LIMIT || fabsf(sy[k]) > VGL_COORD_LIMIT) {
-                bad = 1;
-                break;
-            }
+            sx[k] = vc[k]->sx; sy[k] = vc[k]->sy; vz[k] = vc[k]->vz;
+            if (vc[k]->bad) { bad = 1; }
         }
-        if (bad) { continue; }
+        if (bad) { im->cull_bad++; continue; }
 
         /* 背面剔除(屏幕空间有向面积)；双面材质跳过 */
         float area = (sx[1]-sx[0])*(sy[2]-sy[0]) - (sx[2]-sx[0])*(sy[1]-sy[0]);
-        if (!double_sided && area >= 0.0f) { continue; } /* 顺时针为正面(Y已翻转) */
-        if (fabsf(area) < 0.01f) { continue; }            /* 退化三角形 */
+        if (!double_sided && area >= 0.0f) { im->cull_back++; continue; } /* 顺时针为正面(Y已翻转) */
+        if (fabsf(area) < 0.01f) { im->cull_degen++; continue; }          /* 退化三角形 */
 
-        if (im->tri_count >= im->tri_cap) { break; }
+        if (im->tri_count >= im->tri_cap) { im->cull_capped++; break; }
         vgl_tri_t *T = &im->tris[im->tri_count];
         T->seq = im->tri_count;   /* 稳定排序序号 */
         im->tri_count++;
@@ -472,10 +690,9 @@ static void vgl_draw(r3d_backend_t *self, const r3d_mesh_t *mesh,
             T->sx[k] = sx[k];
             T->sy[k] = sy[k];
             if (use_matcap) {
-                /* matcap：view 空间法线 xy → UV(无 shader，CPU 算) */
-                r3d_vec4_t nv = mul_mv(&im->view, vv[k]->normal.x, vv[k]->normal.y, vv[k]->normal.z, 0.0f);
-                float nx = nv.x, ny = nv.y;
-                float l = sqrtf(nx*nx + ny*ny + nv.z*nv.z);
+                /* matcap：view 空间法线 xy → UV(用缓存的 VIEW 法线) */
+                float nx = vc[k]->vn[0], ny = vc[k]->vn[1], nz = vc[k]->vn[2];
+                float l = sqrtf(nx*nx + ny*ny + nz*nz);
                 if (l > 1e-6f) { nx /= l; ny /= l; }
                 T->uv[k][0] = nx * 0.5f + 0.5f;
                 T->uv[k][1] = -ny * 0.5f + 0.5f;
@@ -487,17 +704,14 @@ static void vgl_draw(r3d_backend_t *self, const r3d_mesh_t *mesh,
         T->depth = (vz[0] + vz[1] + vz[2]) * (1.0f/3.0f);  /* view 空间线性深度，越负越远 */
         T->tex = (tex && tex->valid) ? &tex->buf : NULL;
 
-        /* CPU 光照。对齐 OpenGL：view 空间法线，光方向 view 空间 (0.3,0.5,0.8)。
-           - 普通材质：完整 flat 光照 lit=(0.50+0.32*d+0.18*hemi)*ao。
-           - matcap 材质：matcap 球已提供主反光，这里只叠加柔和的 AO + hemi 调制，
-             给低模表壳的不同朝向面增加明暗层次(缓解"分面平涂"观感)，
-             但不做强漫反射(否则压暗金属反光)。 */
+        /* CPU 光照。对齐 OpenGL：view 空间法线，光方向 view 空间。
+           法线用缓存的 MV 法线三顶点求和(与原逐面重算数值等价)。 */
         uint32_t draw_argb = base_argb;
         {
             float nx=0, ny=0, nz=0, ao=0;
             for (int k = 0; k < 3; k++) {
-                r3d_vec4_t n = mul_mv(&mv, vv[k]->normal.x, vv[k]->normal.y, vv[k]->normal.z, 0.0f);
-                nx += n.x; ny += n.y; nz += n.z; ao += vv[k]->ao;
+                nx += vc[k]->mvn[0]; ny += vc[k]->mvn[1]; nz += vc[k]->mvn[2];
+                ao += vv[k]->ao;
             }
             float l = sqrtf(nx*nx + ny*ny + nz*nz);
             if (l > 1e-6f) { nx /= l; ny /= l; nz /= l; }
@@ -510,13 +724,11 @@ static void vgl_draw(r3d_backend_t *self, const r3d_mesh_t *mesh,
             if (use_matcap)
                 lit = (0.78f + 0.10f*d + 0.12f*hemi) * (0.6f + 0.4f*ao); /* 柔和：保金属亮度 */
             else
-                /* 中性漫反射: ambient + diffuse*d + hemi*hemiTerm，乘 AO，封顶防过曝。
-                   参数运行时可调(set_lighting)，对齐 glTF 在中性环境光下的观感。 */
+                /* 中性漫反射: ambient + diffuse*d + hemi*hemiTerm，乘 AO，封顶防过曝。 */
                 lit = (im->light.ambient + im->light.diffuse*d + im->light.hemi*hemi) * ao;
             float lit_cap = use_matcap ? 1.0f : im->light.lit_max;
             if (lit > lit_cap) lit = lit_cap;
-            /* 无纹理时优先用逐顶点烘焙色(去纹理材质模式)，否则用材质 base_color_factor。
-               三个顶点色取平均(flat)，再乘 flat 光照。 */
+            /* 无纹理时优先用逐顶点烘焙色(去纹理材质模式)，否则用材质 base_color_factor。 */
             uint32_t shade_argb = base_argb;
             if (!tex && (v0->color | v1->color | v2->color)) {
                 uint32_t ar=0, rr=0, gr=0, br=0; int n=0;
@@ -538,20 +750,26 @@ static void vgl_draw(r3d_backend_t *self, const r3d_mesh_t *mesh,
         T->translucent = translucent;
         T->blend = mat->blend;
     }
+
+    /* 累计本次 draw 的收集耗时(投影+透视除法+背面剔除+CPU 光照+写三角形队列)。
+     * 一帧可能多次 draw(多 submesh)，故累加，end_frame 统一并入窗口统计。 */
+    im->collect_us_accum += vgl_now_us() - draw_t0;
 }
 
 /* ---------------- 排序 + flush ---------------- */
 
-/* 画家算法：远的先画。depth=view空间z，越负越远。半透明排在所有不透明之后。 */
-static int tri_cmp(const void *a, const void *b)
+/* 画家算法：远的先画。depth=view空间z，越负越远。半透明排在所有不透明之后。
+ * 排序通过索引比较器 tri_idx_cmp 完成(优化 #3)，避免拷贝 80 字节结构体。 */
+static const vgl_tri_t *g_tri_base;
+static int tri_idx_cmp(const void *a, const void *b)
 {
-    const vgl_tri_t *ta = (const vgl_tri_t *)a, *tb = (const vgl_tri_t *)b;
+    const vgl_tri_t *ta = &g_tri_base[*(const uint32_t *)a];
+    const vgl_tri_t *tb = &g_tri_base[*(const uint32_t *)b];
     if (ta->translucent != tb->translucent)
         return ta->translucent - tb->translucent;       /* 不透明(0)在前 */
     if (ta->depth < tb->depth) return -1;                /* 更负=更远，先画 */
     if (ta->depth > tb->depth) return 1;
-    /* 深度相等：用收集顺序做稳定 tie-breaker。qsort 非稳定排序，相等深度的
-     * 三角形相对次序帧间会变，导致前后覆盖关系跳变 → 画面闪烁。固定为 seq 序。 */
+    /* 深度相等：用收集顺序做稳定 tie-breaker，防止帧间排序抖动闪烁。 */
     if (ta->seq < tb->seq) return -1;
     if (ta->seq > tb->seq) return 1;
     return 0;
@@ -612,9 +830,79 @@ static vg_lite_blend_t to_vgl_blend(int blend, int translucent)
     }
 }
 
+/* 引擎每帧变形后调用：把引擎侧测得的变形耗时(微秒)暂存，
+ * end_frame 时写入当帧原始记录后清零。 */
+static void vgl_perf_frame_mark(r3d_backend_t *self, long deform_us)
+{
+    vgl_impl_t *im = (vgl_impl_t *)self->impl;
+    im->deform_us_pending = deform_us;
+}
+
+/* 把一帧的原始测量值写入环形缓冲(O(1)，覆盖最旧)。 */
+static void vgl_raw_record(vgl_impl_t *im, uint32_t t_frame, uint32_t gpu,
+                           uint32_t collect, uint32_t sort, uint32_t submit,
+                           uint32_t tris, uint32_t drawcalls)
+{
+    if (!im->raw_ring) return;
+    vgl_raw_rec_t *r = &im->raw_ring[im->raw_head];
+    r->frame     = im->global_frame;
+    r->t_frame   = t_frame;
+    r->gpu       = gpu;
+    r->deform    = (uint32_t)(im->deform_us_pending < 0 ? 0 : im->deform_us_pending);
+    r->collect   = collect;
+    r->sort      = sort;
+    r->submit    = submit;
+    r->tris      = tris;
+    r->drawcalls = drawcalls;
+
+    im->raw_head = (im->raw_head + 1) % VGL_PERF_RING_FRAMES;
+    if (im->raw_filled < VGL_PERF_RING_FRAMES) im->raw_filled++;
+    im->global_frame++;
+    im->deform_us_pending = 0;   /* 消费掉，避免下一帧引擎未调用时误用旧值 */
+}
+
+/* 每 N 秒把环形缓冲里的原始逐帧数据批量转储到串口/syslog。
+ * 一次性批量输出(非逐帧内联)，转储后清空缓冲以复用；调用时机在 end_frame 末尾
+ * (帧与帧之间)，把批量 I/O 突发局限在窗口边界。
+ * 格式(离线工具 tools/perf/r3d_perf_analyze.py 解析)：
+ *   头部： r3d_perfraw: HDR n=<帧数> budget_us=16667 fields=frame,t_frame,gpu,deform,collect,sort,submit,tris,drawcalls
+ *   逐帧： r3d_perfraw: F <frame> <t_frame> <gpu> <deform> <collect> <sort> <submit> <tris> <drawcalls>
+ *   结尾： r3d_perfraw: END */
+static void vgl_raw_dump(vgl_impl_t *im)
+{
+    if (!im->raw_ring || im->raw_filled == 0) return;
+
+    uint32_t n = im->raw_filled;
+    /* 最旧样本的起点：缓冲未满时为 0，满时为 head(即将被覆盖的最旧位置)。 */
+    uint32_t start = (im->raw_filled < VGL_PERF_RING_FRAMES) ? 0 : im->raw_head;
+
+    VGL_LOG("%s: HDR n=%u budget_us=%d fields=frame,t_frame,gpu,deform,"
+            "collect,sort,submit,tris,drawcalls",
+            VGL_PERF_RAW_TAG, (unsigned)n, VGL_PERF_BUDGET_US);
+
+    for (uint32_t k = 0; k < n; k++) {
+        const vgl_raw_rec_t *r = &im->raw_ring[(start + k) % VGL_PERF_RING_FRAMES];
+        VGL_LOG("%s: F %u %u %u %u %u %u %u %u %u",
+                VGL_PERF_RAW_TAG,
+                (unsigned)r->frame, (unsigned)r->t_frame, (unsigned)r->gpu,
+                (unsigned)r->deform, (unsigned)r->collect, (unsigned)r->sort,
+                (unsigned)r->submit, (unsigned)r->tris, (unsigned)r->drawcalls);
+    }
+    VGL_LOG("%s: END", VGL_PERF_RAW_TAG);
+
+    /* 转储后清空，下个窗口重新累积(避免相邻窗口重复输出同批帧)。 */
+    im->raw_head = im->raw_filled = 0;
+    im->raw_dump_ms = vgl_now_ms();
+}
+
 /* 每秒一次输出标准 3D 性能统计：FPS + 三角面/draw call/纹理绑定的
- * 平均、最小、最大。把本帧计数并入窗口，跨过 1 秒边界时汇总并重置。 */
-static void vgl_stats_tick(vgl_impl_t *im, uint32_t tris, uint32_t dc, uint32_t tex)
+ * 平均、最小、最大，以及帧内各阶段耗时(微秒)。把本帧计数并入窗口，
+ * 跨过 1 秒边界时汇总并重置。
+ * 阶段耗时(微秒)：collect=CPU 投影+光照+收集，sort=画家算法排序，
+ * submit=构建 path+入命令缓冲，gpu=vg_lite_finish 等待 GPU，frame=整帧 CPU 墙钟。 */
+static void vgl_stats_tick(vgl_impl_t *im, uint32_t tris, uint32_t dc, uint32_t tex,
+                           long collect_us, long sort_us, long submit_us,
+                           long gpu_us, long frame_us)
 {
     im->stat_frames++;
     im->stat_tris_sum += tris;
@@ -627,20 +915,92 @@ static void vgl_stats_tick(vgl_impl_t *im, uint32_t tris, uint32_t dc, uint32_t 
     if (tex  < im->stat_tex_min)  im->stat_tex_min  = tex;
     if (tex  > im->stat_tex_max)  im->stat_tex_max  = tex;
 
+    vgl_ts_add(&im->st_collect, collect_us);
+    vgl_ts_add(&im->st_sort,    sort_us);
+    vgl_ts_add(&im->st_submit,  submit_us);
+    vgl_ts_add(&im->st_gpu,     gpu_us);
+    vgl_ts_add(&im->st_frame,   frame_us);
+
+    /* Deadline-Miss：基于 t_frame(引擎工作墙钟) vs 预算，非受限交付 fps。 */
+    if (frame_us > VGL_PERF_BUDGET_US) {
+        im->stat_miss_count++;
+        uint32_t over = (uint32_t)(frame_us - VGL_PERF_BUDGET_US);
+        if (over > im->stat_worst_over) im->stat_worst_over = over;
+    }
+
+    /* collect 阶段剔除计数并入窗口(算每帧平均) */
+    im->stat_cull_input_sum  += im->cull_input;
+    im->stat_cull_oob_sum    += im->cull_oob;
+    im->stat_cull_behind_sum += im->cull_behind;
+    im->stat_cull_bad_sum    += im->cull_bad;
+    im->stat_cull_back_sum   += im->cull_back;
+    im->stat_cull_degen_sum  += im->cull_degen;
+    im->stat_cull_capped_sum += im->cull_capped;
+
     long now = vgl_now_ms();
     long dt  = now - im->stat_window_ms;
     if (dt < 1000 || im->stat_frames == 0) return;
 
-    float fps = im->stat_frames * 1000.0f / (float)dt;
+    uint32_t nf = im->stat_frames;
+    float fps = nf * 1000.0f / (float)dt;
     VGL_LOG("perf: fps=%.1f frames=%u | tri/f avg=%u min=%u max=%u | "
             "drawcall/f avg=%u min=%u max=%u | tex/f avg=%u min=%u max=%u",
-            fps, (unsigned)im->stat_frames,
-            (unsigned)(im->stat_tris_sum / im->stat_frames),
+            fps, (unsigned)nf,
+            (unsigned)(im->stat_tris_sum / nf),
             (unsigned)im->stat_tris_min, (unsigned)im->stat_tris_max,
-            (unsigned)(im->stat_dc_sum / im->stat_frames),
+            (unsigned)(im->stat_dc_sum / nf),
             (unsigned)im->stat_dc_min, (unsigned)im->stat_dc_max,
-            (unsigned)(im->stat_tex_sum / im->stat_frames),
+            (unsigned)(im->stat_tex_sum / nf),
             (unsigned)im->stat_tex_min, (unsigned)im->stat_tex_max);
+
+    /* 阶段耗时(微秒)：avg/min/max。这是定位瓶颈的关键——
+     * 若 gpu 远大于 collect+submit，则瓶颈在 GPU 填充(减少覆盖面积/像素/AA)；
+     * 若 collect 占大头，则瓶颈在 CPU 顶点处理(morph/投影/逐面光照)。
+     * 16667us = 60fps 单帧预算，可直接对照各阶段占比。
+     * 注：min/max 为单样本极值(p0/p100)，仅作粗略参考；稳健的 p50/p95/p99
+     * 由离线工具在原始逐帧数据(r3d_perfraw)上计算。 */
+    VGL_LOG("perf-time(us): frame avg=%u p0=%u p100=%u | budget60=16667 | "
+            "collect avg=%u max=%u | sort avg=%u max=%u | "
+            "submit avg=%u max=%u | gpu(finish) avg=%u max=%u",
+            (unsigned)(im->st_frame.sum / nf), (unsigned)im->st_frame.min, (unsigned)im->st_frame.max,
+            (unsigned)(im->st_collect.sum / nf), (unsigned)im->st_collect.max,
+            (unsigned)(im->st_sort.sum / nf), (unsigned)im->st_sort.max,
+            (unsigned)(im->st_submit.sum / nf), (unsigned)im->st_submit.max,
+            (unsigned)(im->st_gpu.sum / nf), (unsigned)im->st_gpu.max);
+
+    /* Deadline-Miss(截止期错失)：对硬性 60fps 目标最可执行的指标——
+     * 本秒有多少帧的 t_frame 超过 16667us 预算，及最坏超出量。 */
+    VGL_LOG("perf-miss: budget60=16667 miss=%u/%u (%u%%) worst_over=%uus",
+            (unsigned)im->stat_miss_count, (unsigned)nf,
+            (unsigned)(nf ? im->stat_miss_count * 100 / nf : 0),
+            (unsigned)im->stat_worst_over);
+
+    /* collect 阶段三角形输入/剔除分布(每帧平均)。kept=入队(=tri/f)。
+     * input = kept + 各类剔除之和。可据此判断:
+     *   - back 通常≈input 一半(背面剔除)，占比异常说明法线/朝向有问题
+     *   - behind/bad 偏高说明相机近平面或坏顶点(morph 变形后越界)
+     *   - capped>0 说明 tri_cap 不足，三角形被丢，需调大 max_triangles */
+    VGL_LOG("perf-cull/f: input avg=%u kept avg=%u | back avg=%u degen avg=%u "
+            "behind avg=%u bad avg=%u oob avg=%u capped avg=%u",
+            (unsigned)(im->stat_cull_input_sum / nf),
+            (unsigned)(im->stat_tris_sum / nf),
+            (unsigned)(im->stat_cull_back_sum / nf),
+            (unsigned)(im->stat_cull_degen_sum / nf),
+            (unsigned)(im->stat_cull_behind_sum / nf),
+            (unsigned)(im->stat_cull_bad_sum / nf),
+            (unsigned)(im->stat_cull_oob_sum / nf),
+            (unsigned)(im->stat_cull_capped_sum / nf));
+
+    /* 合批潜力(tex=0，画家序相邻同色合并)：各感知量化档下合批后每帧 draw call 均值。
+     * 对照 drawcall/f(当前=每三角形一次)看能降到多少。shift 越大合批越狠、
+     * 画质损失越大。用于决定是否值得实现合批及选哪个档。 */
+    VGL_LOG("perf-batch/f: drawcall_now=%u | s1(128lv)=%u s2(64lv)=%u "
+            "s3(32lv)=%u s4(16lv)=%u",
+            (unsigned)(im->stat_dc_sum / nf),
+            (unsigned)(im->stat_batch_sum[0] / nf),
+            (unsigned)(im->stat_batch_sum[1] / nf),
+            (unsigned)(im->stat_batch_sum[2] / nf),
+            (unsigned)(im->stat_batch_sum[3] / nf));
 
     /* 重置窗口 */
     im->stat_window_ms = now;
@@ -648,6 +1008,53 @@ static void vgl_stats_tick(vgl_impl_t *im, uint32_t tris, uint32_t dc, uint32_t 
     im->stat_tris_sum = im->stat_dc_sum = im->stat_tex_sum = 0;
     im->stat_tris_min = im->stat_dc_min = im->stat_tex_min = 0xFFFFFFFFu;
     im->stat_tris_max = im->stat_dc_max = im->stat_tex_max = 0;
+    vgl_ts_reset(&im->st_collect);
+    vgl_ts_reset(&im->st_sort);
+    vgl_ts_reset(&im->st_submit);
+    vgl_ts_reset(&im->st_gpu);
+    vgl_ts_reset(&im->st_frame);
+    im->stat_cull_input_sum = im->stat_cull_oob_sum = im->stat_cull_behind_sum = 0;
+    im->stat_cull_bad_sum = im->stat_cull_back_sum = 0;
+    im->stat_cull_degen_sum = im->stat_cull_capped_sum = 0;
+    im->stat_miss_count = 0;
+    im->stat_worst_over = 0;
+    for (int L = 0; L < VGL_BATCH_NLEVELS; L++) im->stat_batch_sum[L] = 0;
+}
+
+/* 合批潜力估算：给定画家序(排序索引)，对某量化档(shift)统计合批后 draw call 数。
+ * 规则贴合真实可实现的合批：只合并"画家序中相邻、量化后同色、同 blend、均为
+ * tex=0"的三角形为一次 draw；有纹理三角形各自独立(draw_pattern 无法合批)。
+ * 保持画家序=不改变遮挡与半透明顺序，故这是无正确性风险的合批上限估计。 */
+static uint32_t vgl_batch_count(vgl_impl_t *im, uint8_t shift)
+{
+    uint32_t batches = 0;
+    int have_prev = 0;
+    uint32_t prev_key = 0; int prev_blend = -1, prev_tex = 0;
+    for (uint32_t i = 0; i < im->tri_count; i++) {
+        const vgl_tri_t *T = &im->tris[im->sort_idx[i]];
+        int is_tex = (T->tex != NULL);
+        if (is_tex) {
+            /* 有纹理：必然自成一次 draw，且打断合批链。 */
+            batches++;
+            have_prev = 0;
+            continue;
+        }
+        /* 量化颜色(ABGR8888)：每通道右移 shift 位做感知分档。 */
+        uint32_t c = T->color;
+        uint32_t a = ((c >> 24) & 0xFF) >> shift;
+        uint32_t b = ((c >> 16) & 0xFF) >> shift;
+        uint32_t g = ((c >> 8)  & 0xFF) >> shift;
+        uint32_t r = ( c        & 0xFF) >> shift;
+        uint32_t key = (a << 24) | (b << 16) | (g << 8) | r;
+        if (have_prev && key == prev_key && T->blend == prev_blend && prev_tex == 0) {
+            /* 与前一个同批，不新增 draw。 */
+        } else {
+            batches++;
+            have_prev = 1;
+            prev_key = key; prev_blend = T->blend; prev_tex = 0;
+        }
+    }
+    return batches;
 }
 
 static void vgl_end_frame(r3d_backend_t *self)
@@ -658,19 +1065,37 @@ static void vgl_end_frame(r3d_backend_t *self)
     if (!im->target_valid || im->tri_count == 0) {
         /* 即使没有三角形，begin_frame 里的 vg_lite_clear 命令仍在命令缓冲中，
          * 必须 finish 让其落地，否则随后翻页会显示一块未清屏的缓冲。 */
+        long gpu_us = 0;
         if (im->target_valid) {
+            long g0 = vgl_now_us();
             vg_lite_error_t fe = vg_lite_finish();
+            gpu_us = vgl_now_us() - g0;
             if (fe != VG_LITE_SUCCESS)
                 VGL_ERR("end_frame(empty) vg_lite_finish ret=%d(%s)",
                         (int)fe, vgl_err_str(fe));
         }
-        vgl_stats_tick(im, 0, 0, 0);
+        vgl_stats_tick(im, 0, 0, 0,
+                       im->collect_us_accum, 0, 0, gpu_us,
+                       vgl_now_us() - im->frame_begin_us);
+        vgl_raw_record(im, (uint32_t)(vgl_now_us() - im->frame_begin_us),
+                       (uint32_t)gpu_us, (uint32_t)im->collect_us_accum,
+                       0, 0, 0, 0);
+        if (vgl_now_ms() - im->raw_dump_ms >= VGL_PERF_DUMP_PERIOD_SEC * 1000)
+            vgl_raw_dump(im);
         im->frame_no++;
         return;
     }
 
-    /* 画家算法排序：远→近，半透明最后。 */
-    qsort(im->tris, im->tri_count, sizeof(vgl_tri_t), tri_cmp);
+    /* 画家算法排序(优化 #3)：排序索引而非 80 字节结构体，交换只动 4 字节。 */
+    long sort_t0 = vgl_now_us();
+    for (uint32_t i = 0; i < im->tri_count; i++) im->sort_idx[i] = i;
+    g_tri_base = im->tris;
+    qsort(im->sort_idx, im->tri_count, sizeof(uint32_t), tri_idx_cmp);
+    long sort_us = vgl_now_us() - sort_t0;
+
+    /* 合批潜力分析(只统计不改绘制)：各量化档下合批后 draw call 数并入窗口。 */
+    for (int L = 0; L < VGL_BATCH_NLEVELS; L++)
+        im->stat_batch_sum[L] += vgl_batch_count(im, VGL_BATCH_SHIFT[L]);
 
     /* 逐三角形绘制(保持画家算法的逐面遮挡 + 每面 flat 光照的明暗层次，
      * 这是立体感的来源；不做"同色合批"——合批会把曲面上相邻、量化后同色的
@@ -679,8 +1104,9 @@ static void vgl_end_frame(r3d_backend_t *self)
      * VGL_FLUSH_BATCH 次 flush 一次 + 帧末统一 finish。 */
     int pending_draws = 0;
 
+    long submit_t0 = vgl_now_us();   /* 命令缓冲构建耗时起点(不含末尾 GPU 等待) */
     for (uint32_t i = 0; i < im->tri_count; i++) {
-        vgl_tri_t *T = &im->tris[i];
+        vgl_tri_t *T = &im->tris[im->sort_idx[i]];   /* 按排序后的索引取三角形 */
 
         vg_lite_path_t *pp = (i < im->vgpaths_cap) ? &im->vgpaths[i] : NULL;
         if (!pp) break;
@@ -754,13 +1180,25 @@ static void vgl_end_frame(r3d_backend_t *self)
             pending_draws = 0;
         }
     }
+    long submit_us = vgl_now_us() - submit_t0;  /* 命令缓冲构建总耗时(CPU 侧) */
 
+    long gpu_t0 = vgl_now_us();
     vg_lite_error_t fe = vg_lite_finish();
+    long gpu_us = vgl_now_us() - gpu_t0;        /* 真正的 GPU 填充墙钟(阻塞等待) */
     if (fe != VG_LITE_SUCCESS)
         VGL_ERR("end_frame vg_lite_finish ret=%d(%s)", (int)fe, vgl_err_str(fe));
 
     /* path 数据写在常驻 im->path_data，下一帧直接覆写复用，destroy 时统一释放。 */
-    vgl_stats_tick(im, submit_tris, im->draw_calls, im->tex_binds);
+    long frame_us = vgl_now_us() - im->frame_begin_us;
+    vgl_stats_tick(im, submit_tris, im->draw_calls, im->tex_binds,
+                   im->collect_us_accum, sort_us, submit_us, gpu_us,
+                   frame_us);
+    /* 原始逐帧记录 + 每 N 秒批量转储(在帧末、帧间发出，把 I/O 突发局限在窗口边界)。 */
+    vgl_raw_record(im, (uint32_t)frame_us, (uint32_t)gpu_us,
+                   (uint32_t)im->collect_us_accum, (uint32_t)sort_us,
+                   (uint32_t)submit_us, submit_tris, im->draw_calls);
+    if (vgl_now_ms() - im->raw_dump_ms >= VGL_PERF_DUMP_PERIOD_SEC * 1000)
+        vgl_raw_dump(im);
     im->frame_no++;
 }
 
@@ -797,6 +1235,7 @@ static const r3d_backend_vtable_t VGL_VT = {
     .end_frame       = vgl_end_frame,
     .present         = vgl_present,
     .query_feature   = vgl_query_feature,
+    .perf_frame_mark = vgl_perf_frame_mark,
 };
 
 r3d_backend_t *r3d_backend_vglite_create(void)
