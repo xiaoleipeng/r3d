@@ -329,6 +329,8 @@ static vg_lite_buffer_format_t to_vgl_format(r3d_pixel_format_t f)
 {
     switch (f) {
         case R3D_FMT_BGRA8888: return VG_LITE_BGRA8888;
+        case R3D_FMT_BGR888:   return VG_LITE_BGR888;   /* 24bpp 打包 BGR(3 字节)，
+                                                         * 与 LVGL RGB888→BGR888 一致 */
         case R3D_FMT_RGB565:   return VG_LITE_BGR565;
         case R3D_FMT_ARGB8888:
         default:               return VG_LITE_ARGB8888;
@@ -526,7 +528,7 @@ static void vgl_begin_frame(r3d_backend_t *self, const r3d_target_t *target)
                          : (vg_lite_uint32_t)(uintptr_t)target->pixels;
     im->target.handle = NULL;   /* 外部 framebuffer：无 vg_lite 分配句柄 */
     im->target.image_mode    = VG_LITE_NORMAL_IMAGE_MODE;
-    im->target.transparency  = VG_LITE_IMAGE_OPAQUE;
+    im->target.transparency_mode  = VG_LITE_IMAGE_OPAQUE;
     im->target.compress_mode = VG_LITE_DEC_DISABLE;
     im->target.fc_enable     = 0;
     im->target.premultiplied = 0;

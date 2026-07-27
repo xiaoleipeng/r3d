@@ -40,6 +40,8 @@ typedef enum {
     R3D_FMT_ARGB8888 = 0,   /* 预乘，主格式 */
     R3D_FMT_RGB565   = 1,
     R3D_FMT_BGRA8888 = 2,   /* NuttX FB_FMT_RGB32 真机帧缓冲常见序 (B,G,R,A) */
+    R3D_FMT_BGR888   = 3,   /* NuttX FB_FMT_RGB24：24bpp 打包 BGR(3 字节/像素)，
+                             * p62 等面板(CONFIG_LCDC_L1_RGB888)的真机帧缓冲格式 */
 } r3d_pixel_format_t;
 
 /* ---- 顶点（运行时，解码后）---- */

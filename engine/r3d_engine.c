@@ -137,6 +137,8 @@ static r3d_pixel_format_t fb_fmt_to_r3d(uint8_t nuttx_fmt)
 {
     switch (nuttx_fmt) {
         case FB_FMT_RGB32:     return R3D_FMT_BGRA8888; /* B,G,R,A in mem */
+        case FB_FMT_RGB24:     return R3D_FMT_BGR888;   /* B,G,R 打包 3 字节/像素
+                                                         * (p62: CONFIG_LCDC_L1_RGB888) */
         case FB_FMT_RGB16_565: return R3D_FMT_RGB565;
         default:
             syslog(LOG_WARNING, "%s: unknown FB fmt %d, assume BGRA8888\n",
@@ -699,17 +701,16 @@ int r3d_engine_screenshot(const char *path)
     if (!fp) return R3D_ENGINE_ERR_FB;
     fprintf(fp, "P6\n%d %d\n255\n", ctx->fb_w, ctx->fb_h);
 
-    int bgr = (ctx->fmt == R3D_FMT_BGRA8888);
+    /* 按字节偏移读取，兼容 24bpp(3 字节)与 32bpp(4 字节)。
+     * 三种真机格式的内存字节序都是 B,G,R(,A)：
+     *   BGRA8888 → 4 字节 B,G,R,A；BGR888 → 3 字节 B,G,R；
+     *   ARGB8888(本实现按小端 uint32 读取时)同样是 byte0=B,byte1=G,byte2=R。 */
+    int bpp = (ctx->fmt == R3D_FMT_BGR888) ? 3 : 4;
     for (int y = 0; y < ctx->fb_h; y++) {
-        const uint32_t *row = (const uint32_t *)(src + (size_t)y * ctx->fb_stride);
+        const uint8_t *row = src + (size_t)y * ctx->fb_stride;
         for (int x = 0; x < ctx->fb_w; x++) {
-            uint32_t p = row[x];
-            uint8_t r, g, b;
-            if (bgr) { /* B,G,R,A */
-                b = (p >> 0) & 0xFF; g = (p >> 8) & 0xFF; r = (p >> 16) & 0xFF;
-            } else {   /* ARGB8888 */
-                r = (p >> 16) & 0xFF; g = (p >> 8) & 0xFF; b = (p >> 0) & 0xFF;
-            }
+            const uint8_t *px = row + (size_t)x * bpp;
+            uint8_t b = px[0], g = px[1], r = px[2];
             uint8_t rgb[3] = { r, g, b };
             fwrite(rgb, 1, 3, fp);
         }
