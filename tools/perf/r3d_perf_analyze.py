@@ -43,12 +43,14 @@ import math
 RAW_TAG = "r3d_perfraw:"
 
 # 字段名 → 在 F 行中的列索引（与固件 fields= 头部一致，作为默认/回退）。
-DEFAULT_FIELDS = ["frame", "t_frame", "gpu", "deform",
-                  "collect", "sort", "submit", "tris", "drawcalls"]
+DEFAULT_FIELDS = ["frame", "t_frame", "wait", "anim", "node", "deform",
+                  "collect", "sort", "submit", "sbuild", "sdraw", "sflush",
+                  "gpu", "pan", "tris", "drawcalls", "tex"]
 
 # 参与统计分析的耗时指标（morph 聚焦：核心三项 + 可选阶段）。
-CORE_METRICS = ["t_frame", "gpu", "deform"]
-OPTIONAL_METRICS = ["collect", "submit"]
+CORE_METRICS = ["t_frame", "submit", "gpu", "deform"]
+OPTIONAL_METRICS = ["collect", "sort", "sbuild", "sdraw", "sflush",
+                    "anim", "node", "wait", "pan"]
 
 
 def parse_log(lines):
@@ -216,15 +218,24 @@ def export_csv(records, fields, path):
 
 # 各阶段中文标签与说明，用于 HTML 报告的瓶颈分解。
 STAGE_LABELS = {
-    "t_frame": ("整帧", "begin_frame→end_frame 整帧 CPU 墙钟"),
-    "gpu":     ("GPU填充", "vg_lite_finish 阻塞等待 GPU"),
+    "t_frame": ("整帧", "begin_frame→end_frame 整帧 CPU 墙钟(不含 wait/pan)"),
+    "wait":    ("等待", "双缓冲 poll 等空闲缓冲(vsync 空闲，非 CPU 工作)"),
+    "anim":    ("动画", "r3d_anim_update 关键帧采样+混合"),
+    "node":    ("节点矩阵", "逐 DYNAMIC_NODE submesh 的 r3d_anim_node_matrix 累计"),
     "deform":  ("变形", "CPU 顶点变形(morph/skin)"),
     "collect": ("收集", "投影+透视除法+背面剔除+逐面光照"),
     "sort":    ("排序", "画家算法 qsort"),
-    "submit":  ("提交", "逐三角形构建 path + vg_lite_draw 入命令缓冲"),
+    "submit":  ("提交", "建 path + vg_lite_draw 入命令缓冲(= build+draw+flush)"),
+    "sbuild":  ("submit·建path", "CPU 构建 path 顶点/bbox/仿射"),
+    "sdraw":   ("submit·draw调用", "vg_lite_draw/draw_pattern 调用(driver 侧)"),
+    "sflush":  ("submit·flush", "周期 vg_lite_flush"),
+    "gpu":     ("GPU(finish残余)", "vg_lite_finish 残余等待，非 GPU 利用率(与 submit 并行)"),
+    "pan":     ("翻页", "FBIOPAN_DISPLAY(上一帧值)"),
 }
-# 构成整帧的子阶段（用于占比分解；gpu 也计入，t_frame 不计入自己）。
-BREAKDOWN_STAGES = ["deform", "collect", "sort", "submit", "gpu"]
+# 构成整帧的子阶段（用于占比分解）。submit 用其三个细分(sbuild/sdraw/sflush)代替，
+# 避免与 submit 重复计数；wait/pan 在 t_frame 之外，不计入分解。相加≈t_frame。
+BREAKDOWN_STAGES = ["anim", "node", "deform", "collect", "sort",
+                    "sbuild", "sdraw", "sflush", "gpu"]
 
 
 def build_html(records, fields, budget):

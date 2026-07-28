@@ -74,9 +74,15 @@
       <span id="fileinfo"></span> ·
       <a id="reset">重新选择文件</a> ·
       预算 <input id="budget" type="number" value="16667" style="width:80px;background:#20242f;color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:2px 6px"> us
-      <a id="reapply">应用</a>
+      <a id="reapply">应用</a> ·
+      <a id="exportmd">⬇ 导出 MD 报告</a>
     </div>
+    <div id="modelbar" style="display:none;margin:8px 0;line-height:2.2"></div>
+    <div id="compare"></div>
     <div id="cards" class="cards"></div>
+
+    <h2>自动结论</h2>
+    <div id="verdict"></div>
 
     <h2>瓶颈分解（占整帧 avg 比例）</h2>
     <div id="breakdown"></div>
@@ -84,7 +90,17 @@
 
     <h2>各指标统计（微秒）</h2>
     <div id="stats"></div>
-    <div class="note">p50 稳健(抗离群)，p99/max 反映卡顿尖峰，jitter 反映平滑度，1%/0.1% low 为最差帧均值。</div>
+    <div class="note" style="line-height:1.8">
+      <b>列含义</b>（鼠标悬停表头也有提示）：
+      <b>avg</b>=平均值；
+      <b>p50</b>=中位数(一半帧比它快，抗离群、代表“典型”一帧)；
+      <b>p95/p99</b>=95%/99% 分位(只有 5%/1% 的帧比它慢，反映偶发卡顿的严重度)；
+      <b>min/max</b>=最快/最慢单帧；
+      <b>std</b>=标准差(越大越不稳定)；
+      <b>jitter</b>=相邻帧耗时差的平均(越小越平滑，直接对应观感抖动)；
+      <b>1% low / 0.1% low</b>=最慢那 1% / 0.1% 帧的平均(游戏界常用的“最差体验”指标，比 max 稳健)。
+      <br><span class="mut">看法：p50 看典型性能；p99/max/1%low 看卡顿；jitter/std 看平滑度。三者背离越大说明越不稳。</span>
+    </div>
 
     <h2>逐帧曲线</h2>
     <div class="legend">
@@ -94,6 +110,12 @@
       <span><i style="background:#ff5c5c"></i>预算线</span>
     </div>
     <canvas id="chart"></canvas>
+    <div class="note" style="line-height:1.8">
+      <b>怎么看</b>：横轴=帧序号，纵轴=单帧耗时(us)，红色虚线=每帧预算(60fps=16667us)。
+      <b>蓝线(t_frame)</b>长期在红线之上→整体掉帧；<b>橙线(submit)</b>越贴近蓝线，说明整帧时间越被 submit 主导；
+      <b>绿线(deform)</b>高则 CPU 变形是大头。曲线<b>平直</b>=稳定，<b>频繁上下跳</b>=抖动，
+      <b>等间隔的孤立尖峰</b>常是周期性事件(如每 5s 一次的日志转储、GC)污染，可在采集时消除。
+    </div>
 
     <h2>直方图</h2>
     <div id="hist"></div>
@@ -108,27 +130,57 @@
 "use strict";
 
 var RAW_TAG = "r3d_perfraw:";
-var DEFAULT_FIELDS = ["frame","t_frame","gpu","deform","collect","sort","submit","tris","drawcalls"];
-var CORE = ["t_frame","gpu","deform"];
-var OPT  = ["collect","submit","sort"];
+var DEFAULT_FIELDS = ["frame","t_frame","wait","anim","node","deform","collect",
+                      "sort","submit","sbuild","sdraw","sflush","gpu","pan",
+                      "tris","drawcalls","tex"];
+var CORE = ["t_frame","submit","gpu","deform"];
+var OPT  = ["collect","sort","sbuild","sdraw","sflush","anim","node","wait","pan"];
 var STAGE = {
-  t_frame:["整帧","begin_frame→end_frame 整帧 CPU 墙钟"],
-  gpu:["GPU填充","vg_lite_finish 阻塞等待 GPU"],
+  t_frame:["整帧","begin_frame→end_frame 整帧 CPU 墙钟(不含 wait/pan)"],
+  wait:["等待","双缓冲 poll 等空闲缓冲(vsync 空闲，非 CPU 工作)"],
+  anim:["动画","r3d_anim_update 关键帧采样+混合"],
+  node:["节点矩阵","逐 DYNAMIC_NODE submesh 的 r3d_anim_node_matrix 累计"],
   deform:["变形","CPU 顶点变形(morph/skin)"],
   collect:["收集","投影+透视除法+背面剔除+逐面光照"],
   sort:["排序","画家算法 qsort"],
-  submit:["提交","逐三角形构建 path + vg_lite_draw 入命令缓冲"]
+  submit:["提交","建 path + vg_lite_draw 入命令缓冲(= build+draw+flush)"],
+  sbuild:["submit·建path","CPU 构建 path 顶点/bbox/仿射"],
+  sdraw:["submit·draw调用","vg_lite_draw/draw_pattern 调用(driver 侧)"],
+  sflush:["submit·flush","周期 vg_lite_flush"],
+  gpu:["GPU(finish残余)","vg_lite_finish 残余等待，非 GPU 利用率(flush 使其与 submit 并行)"],
+  pan:["翻页","FBIOPAN_DISPLAY(上一帧值)"]
 };
-var BREAKDOWN = ["deform","collect","sort","submit","gpu"];
+/* 占整帧分解用“叶子”阶段(相加≈t_frame)：submit 用其三个细分代替，避免与
+ * sbuild/sdraw/sflush 重复计数；wait/pan 在 t_frame 之外，不计入分解。 */
+var BREAKDOWN = ["anim","node","deform","collect","sort","sbuild","sdraw","sflush","gpu"];
 
-var G = { records:[], fields:DEFAULT_FIELDS, budget:16667, fname:"" };
+var G = { records:[], fields:DEFAULT_FIELDS, budget:16667, fname:"", models:[], model:"__ALL__" };
 
-/* ---------- 解析 ---------- */
+/* ---------- 解析 ----------
+ * 每帧按其所属 b3dm 打标(rec.__model)。demo 每切换模型会打印一行
+ *   [r3d_demo] playing [i/N]: /path/Model.b3dm
+ * 且每个模型是独立 engine/backend(帧号从 0 重置)。因此以 "playing" 标记作为分段
+ * 边界：标记之后、下一个标记之前的所有 r3d_perfraw 帧都归属该模型。ring-buffer
+ * 每次转储会重复整段帧，故在“每段内”按帧号去重(标记处重置去重表)。
+ * 无标记的日志(单模型/旧日志)：全部归为一段“全部”。 */
 function parseLog(text){
-  var fields = DEFAULT_FIELDS, records = [], seen = {};
+  var fields = DEFAULT_FIELDS, records = [], models = [];
   var lines = text.split(/\r?\n/);
+  var curModel = null, seg = 0, seen = {}, order = 0;
+  /* 优先用固件的 syslog 标记 "r3d_vgl: perf model=<name>"：它与逐帧转储同一路
+   * (顺序可靠)，且固件切模型时会先转储上一个模型残留帧、帧号清零，故分段精确。
+   * 回退：demo 的 stdout 行 "playing [i/N]: path"(旧日志/无固件标记时用，顺序近似)。 */
+  var reMark2 = /\bperf model=(\S+)/;
+  var reMark  = /playing\s*\[\s*\d+\s*\/\s*\d+\s*\]\s*:\s*(\S+)/;
+  function baseName(pth){ return pth.replace(/\\/g,"/").replace(/\/+$/,"").split("/").pop(); }
   for(var li=0; li<lines.length; li++){
     var line = lines[li];
+    var mk = line.match(reMark2) || line.match(reMark);
+    if(mk){
+      curModel = baseName(mk[1]);
+      seg++; seen = {};      /* 新一段：重置该段的帧去重表 */
+      continue;
+    }
     var idx = line.indexOf(RAW_TAG);
     if(idx < 0) continue;
     var p = line.substring(idx + RAW_TAG.length).trim();
@@ -155,15 +207,32 @@ function parseLog(text){
       for(var f=0;f<fields.length;f++) rec[fields[f]] = vals[f];
       var fno = rec.frame;
       if(fno !== undefined){
-        if(seen[fno]) continue;
+        if(seen[fno]) continue;     /* 同段内 ring 重复转储去重 */
         seen[fno] = 1;
       }
+      rec.__model = curModel || "全部";
+      rec.__i = order++;            /* 日志出现顺序(“全部”视图排序用) */
+      if(models.indexOf(rec.__model) < 0) models.push(rec.__model);
       records.push(rec);
     }
   }
-  if(records.length && records[0].frame !== undefined)
-    records.sort(function(a,b){return a.frame-b.frame;});
-  return {records:records, fields:fields};
+  return {records:records, fields:fields, models:models};
+}
+
+/* 按当前选择(G.model)取子集。单模型：按帧号排序；全部：按日志顺序(各模型连续)。 */
+function currentRecs(){
+  var recs = G.records;
+  if(G.model && G.model !== "__ALL__")
+    recs = recs.filter(function(r){ return r.__model === G.model; });
+  recs = recs.slice();
+  if(G.model && G.model !== "__ALL__")
+    recs.sort(function(a,b){ return (a.frame-b.frame) || (a.__i-b.__i); });
+  else
+    recs.sort(function(a,b){ return a.__i-b.__i; });
+  return recs;
+}
+function modelCount(name){
+  var c=0; for(var i=0;i<G.records.length;i++) if(G.records[i].__model===name) c++; return c;
 }
 
 /* ---------- 统计 ---------- */
@@ -204,9 +273,64 @@ function analyze(name, vals, budget){
 }
 function us(v){ return Math.round(v).toLocaleString(); }
 
+/* ---------- 按 b3dm 分类 ---------- */
+function selectModel(m){
+  G.model = m;
+  renderModelBar(); renderCompare(); updateFileInfo(); render();
+}
+function updateFileInfo(){
+  var sel = (G.model==="__ALL__") ? "全部" : G.model;
+  var extra = (G.models && G.models.length>1) ? (" · "+G.models.length+" 个 b3dm · 当前: "+sel) : "";
+  document.getElementById("fileinfo").textContent =
+    "文件: "+G.fname+" · 帧数: "+currentRecs().length+extra;
+}
+function renderModelBar(){
+  var el=document.getElementById("modelbar");
+  if(!G.models || G.models.length<2){ el.style.display="none"; el.innerHTML=""; return; }
+  el.style.display="block";
+  function tab(m, label){
+    var on=(G.model===m);
+    return '<a data-m="'+m.replace(/"/g,'')+'" style="display:inline-block;padding:2px 10px;margin:2px 4px 2px 0;'+
+      'border:1px solid var(--line);border-radius:6px;cursor:pointer;'+
+      (on?'background:#2b6cff;color:#fff;border-color:#2b6cff;':'')+'">'+label+'</a>';
+  }
+  var h='<span class="mut">按 b3dm 分类：</span> '+tab("__ALL__","全部("+G.records.length+")");
+  for(var i=0;i<G.models.length;i++){ var nm=G.models[i]; h+=tab(nm, nm+"("+modelCount(nm)+")"); }
+  el.innerHTML=h;
+  var tabs=el.querySelectorAll("a[data-m]");
+  for(i=0;i<tabs.length;i++) tabs[i].addEventListener("click", function(){ selectModel(this.getAttribute("data-m")); });
+}
+/* 各 b3dm 关键指标对比表 */
+function renderCompare(){
+  var el=document.getElementById("compare");
+  if(!G.models || G.models.length<2){ el.innerHTML=""; return; }
+  function colAvg(rs,f){ var s=0,c=0; for(var i=0;i<rs.length;i++) if(f in rs[i]){s+=rs[i][f];c++;} return c?s/c:0; }
+  var h='<h2>各 b3dm 分类对比</h2><table><tr><th>b3dm</th><th>帧数</th><th>帧率(fps)</th>'+
+        '<th>整帧avg</th><th>整帧p95</th><th>submit avg</th><th>gpu avg</th><th>三角/帧</th><th>超预算%</th></tr>';
+  for(var mi=0; mi<G.models.length; mi++){
+    var name=G.models[mi];
+    var rs=G.records.filter(function(r){ return r.__model===name; });
+    var tf=[]; for(var i=0;i<rs.length;i++) if("t_frame" in rs[i]) tf.push(rs[i].t_frame);
+    var tfa=colAvg(rs,"t_frame"), fps=tfa?1e6/tfa:0;
+    var s=tf.slice().sort(function(a,b){return a-b;});
+    var p95=s.length?percentile(s,95):0;
+    var over=0; for(i=0;i<tf.length;i++) if(tf[i]>G.budget) over++;
+    var sel=(G.model===name);
+    h+='<tr data-model="'+name.replace(/"/g,'')+'" style="cursor:pointer;'+(sel?'background:#1c2c52;':'')+'">'+
+       '<td><b>'+name+'</b></td><td>'+rs.length+'</td><td>'+fps.toFixed(1)+'</td>'+
+       '<td>'+us(tfa)+'</td><td class="warn">'+us(p95)+'</td><td>'+us(colAvg(rs,"submit"))+'</td>'+
+       '<td>'+us(colAvg(rs,"gpu"))+'</td><td>'+us(colAvg(rs,"tris"))+'</td>'+
+       '<td class="'+(over*100/(tf.length||1)>=50?"bad":(over?"warn":""))+'">'+(tf.length?(100*over/tf.length).toFixed(0):0)+'%</td></tr>';
+  }
+  h+='</table><div class="note">点击某行(或上方标签)只看该 b3dm 的详细分析；“全部”为混合视图。</div>';
+  el.innerHTML=h;
+  var rows=el.querySelectorAll("tr[data-model]");
+  for(i=0;i<rows.length;i++) rows[i].addEventListener("click", function(){ selectModel(this.getAttribute("data-model")); });
+}
+
 /* ---------- 渲染 ---------- */
 function render(){
-  var recs=G.records, fields=G.fields, budget=G.budget, n=recs.length;
+  var recs=currentRecs(), fields=G.fields, budget=G.budget, n=recs.length;
   var metrics=[]; var all=CORE.concat(OPT), seen={};
   for(var i=0;i<all.length;i++){ var m=all[i];
     if(fields.indexOf(m)>=0 && !seen[m]){ seen[m]=1; metrics.push(m); } }
@@ -244,8 +368,23 @@ function render(){
   }
   h+='</table>'; document.getElementById("breakdown").innerHTML=h;
 
-  /* 统计表 */
-  h='<table><tr><th>指标</th><th>avg</th><th>p50</th><th>p95</th><th>p99</th><th>min</th><th>max</th><th>std</th><th>jitter</th><th>1% low</th><th>0.1% low</th></tr>';
+  /* 统计表(表头带 title 悬停解释) */
+  var HTH=[
+    ["指标","该阶段/指标名称"],
+    ["avg","平均值：所有帧的算术平均"],
+    ["p50","中位数：一半帧比它快，抗离群，代表“典型”一帧"],
+    ["p95","95 分位：只有 5% 的帧比它慢，反映较常见的偏慢"],
+    ["p99","99 分位：只有 1% 的帧比它慢，反映偶发卡顿的严重度"],
+    ["min","最快单帧"],
+    ["max","最慢单帧(极端尖峰)"],
+    ["std","标准差：离散程度，越大越不稳定"],
+    ["jitter","相邻帧耗时差的平均：越小越平滑，直接对应观感抖动"],
+    ["1% low","最慢 1% 帧的平均：最差体验指标(比 max 稳健)"],
+    ["0.1% low","最慢 0.1% 帧的平均：极端最差体验"]
+  ];
+  h='<table><tr>';
+  for(i=0;i<HTH.length;i++) h+='<th title="'+HTH[i][1]+'">'+HTH[i][0]+'</th>';
+  h+='</tr>';
   for(i=0;i<metrics.length;i++){ var st2=stats[metrics[i]]; if(!st2) continue;
     var lb=STAGE[metrics[i]]||[metrics[i],""];
     h+='<tr><td><b>'+lb[0]+'</b> <span class="mut">'+metrics[i]+'</span></td><td>'+us(st2.avg)+'</td><td>'+us(st2.p50)+'</td><td>'+us(st2.p95)+'</td><td class="warn">'+us(st2.p99)+'</td><td>'+us(st2.min)+'</td><td class="bad">'+us(st2.max)+'</td><td>'+us(st2.std)+'</td><td>'+us(st2.jitter)+'</td><td>'+us(st2.low1)+'</td><td>'+us(st2.low01)+'</td></tr>';
@@ -271,7 +410,183 @@ function render(){
   }
   h+='</table>'; document.getElementById("detail").innerHTML=h;
 
+  document.getElementById("verdict").innerHTML = buildVerdict(stats, recs, budget, frameAvg, fps, missPct, bd);
+
   drawChart(recs, budget);
+}
+
+/* 检测近似等间隔的尖峰(t_frame 超阈值)，返回大致周期(帧)或 null(无周期性) */
+function detectPeriodicSpikes(recs, tf){
+  var thr = Math.max(tf.p95*1.3, tf.p50*1.6);
+  var idx=[]; for(var i=0;i<recs.length;i++) if((recs[i].t_frame||0) > thr) idx.push(i);
+  if(idx.length < 3) return null;
+  var gaps=[]; for(i=1;i<idx.length;i++) gaps.push(idx[i]-idx[i-1]);
+  var m=0; for(i=0;i<gaps.length;i++) m+=gaps[i]; m/=gaps.length;
+  if(m < 5) return null;
+  var okc=0; for(i=0;i<gaps.length;i++) if(Math.abs(gaps[i]-m) <= m*0.35) okc++;
+  return (okc/gaps.length >= 0.6) ? Math.round(m) : null;
+}
+
+/* 依据已算好的统计生成结论要点(纯文本，用 **粗体** 标记；HTML 与 MD 共用)。 */
+function verdictLines(stats, recs, budget, frameAvg, fps, missPct, bd){
+  if(!stats.t_frame || !recs.length) return null;
+  var tf=stats.t_frame, L=[];
+
+  var ratio = budget ? frameAvg/budget : 0;
+  var rate = fps>=58 ? "流畅" : (fps>=30 ? "偏卡" : "严重卡顿");
+  L.push('总体：**'+rate+'**，实测约 **'+fps.toFixed(1)+' fps**（整帧 avg '+us(frameAvg)+'us / 预算 '+budget+'us，超支 '+ratio.toFixed(2)+'×）。');
+
+  if(bd && bd.length){
+    var top=bd[0], lab=(STAGE[top[0]]||[top[0]])[0];
+    L.push('主要瓶颈：**'+lab+'**，占整帧 **'+top[2].toFixed(0)+'%**（avg '+us(top[1])+'us）。');
+  }
+
+  if(stats.gpu){
+    var gp = frameAvg ? 100*stats.gpu.avg/frameAvg : 0;
+    if(gp < 10)
+      L.push('**CPU 受限**：GPU(finish) 仅占 '+gp.toFixed(1)+'%（且是残余等待、非 GPU 利用率），时间几乎都在 CPU 侧。');
+    else
+      L.push('GPU 等待占 '+gp.toFixed(1)+'%，是否 GPU 受限需结合硬件计数器确认。');
+  }
+
+  if(stats.submit && recs[0] && ('drawcalls' in recs[0])){
+    var dcv=0,trv=0,c=0;
+    for(var i=0;i<recs.length;i++){ if('drawcalls' in recs[i]) dcv+=recs[i].drawcalls; if('tris' in recs[i]) trv+=recs[i].tris; c++; }
+    var dc=c?dcv/c:0, tri=c?trv/c:0, subPct=frameAvg?100*stats.submit.avg/frameAvg:0;
+    if(subPct>=30){
+      var rDT = dc>0 ? tri/dc : 0;
+      L.push('submit 占 '+subPct.toFixed(0)+'%、draw call ≈ **'+us(dc)+'/帧**'+
+        ((rDT>0&&rDT<1.5)?'（≈1 三角形 1 次 draw，几乎没合批）':'')+
+        '，**合批减少 draw call** 是降 submit 的最大杠杆。');
+    }
+  }
+  if(stats.sdraw && stats.sbuild){
+    var sd=stats.sdraw.avg, sb=stats.sbuild.avg;
+    if(sd>sb*1.2) L.push('submit 细分：**driver 的 vg_lite_draw 调用**为主(sdraw '+us(sd)+' > sbuild '+us(sb)+')，减少 draw call 次数最有效。');
+    else if(sb>sd*1.2) L.push('submit 细分：**CPU 建 path**为主(sbuild '+us(sb)+' > sdraw '+us(sd)+')，可优化顶点/仿射构建。');
+  }
+
+  var spike = tf.p50 ? tf.p99/tf.p50 : 1;
+  if(spike>1.5 || tf.max > tf.p95*1.5)
+    L.push('存在**卡顿尖峰**：p99/p50='+spike.toFixed(2)+'，max '+us(tf.max)+'us ≫ p95 '+us(tf.p95)+'us。');
+  else
+    L.push('帧耗时较稳定：p99/p50='+spike.toFixed(2)+'，jitter '+us(tf.jitter)+'us。');
+
+  var per = detectPeriodicSpikes(recs, tf);
+  if(per) L.push('检测到**周期性尖峰**：约每 **'+per+' 帧**一次，疑似日志转储/GC 等周期事件污染，建议采集时改为“跑完一次性转储”。');
+
+  if(recs.length>3 && tf.p50 && recs[0].t_frame > tf.p50*1.4)
+    L.push('首帧 '+us(recs[0].t_frame)+'us 明显高于典型值(冷启动预热)，统计前建议剔除前若干帧。');
+
+  L.push('超预算帧(Deadline-Miss)占比 **'+missPct.toFixed(0)+'%**。');
+  return L;
+}
+/* **粗体** → <b>；并给评级词上色 */
+function mdInline(s){
+  s = s.replace(/\*\*(.+?)\*\*/g,'<b>$1</b>');
+  s = s.replace(/(严重卡顿)/g,'<span class="bad">$1</span>')
+       .replace(/(偏卡)/g,'<span class="warn">$1</span>')
+       .replace(/(流畅)/g,'<span class="ok">$1</span>');
+  return s;
+}
+function buildVerdict(stats, recs, budget, frameAvg, fps, missPct, bd){
+  var L=verdictLines(stats, recs, budget, frameAvg, fps, missPct, bd);
+  if(!L) return '<div class="note">数据不足，无法生成结论。</div>';
+  var html='<div style="background:#161a22;border:1px solid var(--line);border-radius:8px;padding:8px 14px">'+
+           '<ul style="margin:4px 0;padding-left:20px;line-height:1.95">';
+  for(var i=0;i<L.length;i++) html+='<li>'+mdInline(L[i])+'</li>';
+  html+='</ul></div>';
+  return html;
+}
+
+/* 对一组帧计算完整统计(供 MD 导出复用；与 render 内逻辑一致) */
+function analyzeSet(recs, fields, budget){
+  var metrics=[], all=CORE.concat(OPT), seen={}, i, r;
+  for(i=0;i<all.length;i++){ var m=all[i]; if(fields.indexOf(m)>=0 && !seen[m]){ seen[m]=1; metrics.push(m); } }
+  var stats={};
+  for(i=0;i<metrics.length;i++){ var mm=metrics[i]; var vals=[];
+    for(r=0;r<recs.length;r++) if(mm in recs[r]) vals.push(recs[r][mm]);
+    if(vals.length) stats[mm]=analyze(mm,vals,budget); }
+  var frameAvg=stats.t_frame?stats.t_frame.avg:0;
+  var fps=frameAvg?1e6/frameAvg:0;
+  var missPct=stats.t_frame?stats.t_frame.overPct:0;
+  var bd=[]; for(i=0;i<BREAKDOWN.length;i++){ var st=stats[BREAKDOWN[i]];
+    if(st) bd.push([BREAKDOWN[i], st.avg, frameAvg?100*st.avg/frameAvg:0]); }
+  bd.sort(function(a,b){return b[1]-a[1];});
+  var trv=0,tc=0; for(r=0;r<recs.length;r++) if("tris" in recs[r]){ trv+=recs[r].tris; tc++; }
+  return {metrics:metrics,stats:stats,frameAvg:frameAvg,fps:fps,missPct:missPct,
+          miss:stats.t_frame?stats.t_frame.over:0,bd:bd,trisAvg:tc?trv/tc:0,n:recs.length};
+}
+function mdTable(headers, rows){
+  var h='| '+headers.join(' | ')+' |\n| '+headers.map(function(){return '---';}).join(' | ')+' |\n';
+  for(var i=0;i<rows.length;i++) h+='| '+rows[i].join(' | ')+' |\n';
+  return h;
+}
+/* 生成完整 Markdown 报告(含对比表 + 每个 b3dm 一节) */
+function buildMarkdown(){
+  var budget=G.budget, out=[], i, mi;
+  out.push('# r3d 性能分析报告\n');
+  out.push('- 文件：`'+G.fname+'`');
+  out.push('- 生成时间：'+new Date().toLocaleString());
+  out.push('- 预算：'+budget+' us（目标 '+(1e6/budget).toFixed(0)+' fps）');
+  var models=(G.models&&G.models.length)?G.models.slice():["全部"];
+  out.push('- b3dm 段数：'+models.length+'（'+models.join(', ')+'）\n');
+
+  if(models.length>1){
+    out.push('## 各 b3dm 对比\n');
+    var crows=[];
+    for(mi=0;mi<models.length;mi++){
+      var rsC=G.records.filter(function(r){return r.__model===models[mi];});
+      var aC=analyzeSet(rsC,G.fields,budget);
+      var p95=aC.stats.t_frame?Math.round(aC.stats.t_frame.p95):"-";
+      crows.push([models[mi],aC.n,aC.fps.toFixed(1),Math.round(aC.frameAvg),p95,
+        aC.stats.submit?Math.round(aC.stats.submit.avg):"-",aC.stats.gpu?Math.round(aC.stats.gpu.avg):"-",
+        Math.round(aC.trisAvg),aC.missPct.toFixed(0)+"%"]);
+    }
+    out.push(mdTable(["b3dm","帧数","fps","整帧avg(us)","整帧p95(us)","submit avg","gpu avg","三角/帧","超预算%"],crows));
+  }
+
+  for(mi=0;mi<models.length;mi++){
+    var name=models[mi];
+    var rs=G.records.filter(function(r){return r.__model===name;})
+                    .slice().sort(function(a,b){return (a.frame-b.frame)||(a.__i-b.__i);});
+    var a=analyzeSet(rs,G.fields,budget);
+    out.push('## '+name+'\n');
+    out.push('- 帧数：'+a.n+'　实测帧率：**'+a.fps.toFixed(1)+' fps**　整帧 avg：'+Math.round(a.frameAvg)+
+      ' us　超支：'+(budget?(a.frameAvg/budget).toFixed(2):0)+'×　超预算帧：'+a.missPct.toFixed(0)+'%\n');
+
+    var L=verdictLines(a.stats,rs,budget,a.frameAvg,a.fps,a.missPct,a.bd);
+    if(L){ out.push('### 自动结论'); for(i=0;i<L.length;i++) out.push('- '+L[i]); out.push(''); }
+
+    out.push('### 瓶颈分解（占整帧 avg 比例）');
+    var brows=[]; for(i=0;i<a.bd.length;i++){ var lb=(STAGE[a.bd[i][0]]||[a.bd[i][0],""]);
+      brows.push([lb[0],lb[1]||"",Math.round(a.bd[i][1]),a.bd[i][2].toFixed(1)+"%"]); }
+    out.push(mdTable(["阶段","说明","avg(us)","占比"],brows));
+
+    out.push('### 各指标统计（us）');
+    var srows=[]; for(i=0;i<a.metrics.length;i++){ var st=a.stats[a.metrics[i]]; if(!st) continue;
+      var lb2=(STAGE[a.metrics[i]]||[a.metrics[i]]);
+      srows.push([lb2[0]+" ("+a.metrics[i]+")",Math.round(st.avg),Math.round(st.p50),Math.round(st.p95),
+        Math.round(st.p99),Math.round(st.min),Math.round(st.max),Math.round(st.std),Math.round(st.jitter),
+        Math.round(st.low1),Math.round(st.low01)]); }
+    out.push(mdTable(["指标","avg","p50","p95","p99","min","max","std","jitter","1%low","0.1%low"],srows));
+  }
+
+  out.push('---');
+  out.push('> 名词：p50=中位数(典型)，p95/p99=偏慢分位(卡顿)，jitter=相邻帧差(平滑度)，1%/0.1% low=最差帧均值。');
+  out.push('> gpu 为 vg_lite_finish 残余等待(非 GPU 利用率)；wait/pan 在 t_frame 之外；submit=sbuild+sdraw+sflush。');
+  return out.join("\n");
+}
+function downloadMd(){
+  if(!G.records.length){ msg.textContent="请先加载日志。"; return; }
+  var md=buildMarkdown();
+  var blob=new Blob([md],{type:"text/markdown;charset=utf-8"});
+  var url=URL.createObjectURL(blob);
+  var a=document.createElement("a");
+  a.href=url;
+  a.download=(G.fname? G.fname.replace(/\.[^.]+$/,"") : "r3d_perf")+"_report.md";
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  URL.revokeObjectURL(url);
 }
 
 function histHtml(name, vals, budget){
@@ -327,9 +642,11 @@ function handleText(text, name){
     return;
   }
   G.records=res.records; G.fields=res.fields; G.fname=name;
-  document.getElementById("fileinfo").textContent="文件: "+name+" · 帧数: "+res.records.length;
+  G.models=res.models||[];
+  /* 多 b3dm 默认“全部”，单个则直接选它 */
+  G.model = (G.models.length>1) ? "__ALL__" : (G.models[0]||"__ALL__");
   document.getElementById("report").style.display="block";
-  render();
+  renderModelBar(); renderCompare(); updateFileInfo(); render();
   document.getElementById("report").scrollIntoView({behavior:"smooth"});
 }
 function readFile(file){
@@ -369,8 +686,9 @@ document.getElementById("reapply").addEventListener("click", function(){
   var b=parseInt(document.getElementById("budget").value,10);
   if(b>0){ G.budget=b; render(); }
 });
+document.getElementById("exportmd").addEventListener("click", downloadMd);
 window.addEventListener("resize", function(){
-  if(document.getElementById("report").style.display==="block") drawChart(G.records, G.budget);
+  if(document.getElementById("report").style.display==="block") drawChart(currentRecs(), G.budget);
 });
 </script>
 </body>

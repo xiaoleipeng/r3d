@@ -17,10 +17,34 @@ const params = {
   morphLockRatio: 0.002,
   morphLockMaxPct: 0.40,
   animError: 0.01,
+  // 静态额外压缩 + 框选区域减面
+  staticRatio: 1.0,
+  regionEnable: false,
+  regionMode: 'decimate',
+  regionRatio: 0.3,
+  // 框(模型归一化坐标)：中心偏移 [-1,1]、半尺寸 [0,1]，默认居中、覆盖中间一半
+  regionCx: 0, regionCy: 0, regionCz: 0,
+  regionSx: 0.5, regionSy: 0.5, regionSz: 0.5,
   autoConvert: true,
   wireframe: false,
   showNormals: false,
 };
+
+/* 由框选参数换算出 glTF 世界坐标 AABB 字符串 "x0,y0,z0,x1,y1,z1"(未启用返回 null) */
+function computeRegionArg() {
+  if (!params.regionEnable) return null;
+  const c = viewerL.getModelCenter(), h = viewerL.getModelHalf();
+  const cx = c.x + params.regionCx*h.x, cy = c.y + params.regionCy*h.y, cz = c.z + params.regionCz*h.z;
+  const hx = params.regionSx*h.x, hy = params.regionSy*h.y, hz = params.regionSz*h.z;
+  return [cx-hx, cy-hy, cz-hz, cx+hx, cy+hy, cz+hz].map(v => v.toFixed(4)).join(',');
+}
+/* 把当前框选参数同步到左侧线框显示 */
+function refreshRegionBox() {
+  if (typeof viewerL === 'undefined') return;
+  viewerL.updateRegionBox(params.regionEnable,
+    params.regionCx, params.regionCy, params.regionCz,
+    params.regionSx, params.regionSy, params.regionSz);
+}
 
 let currentFile = null;     // 当前上传的原始文件（File）
 let serverFileId = null;    // 服务端保存的文件 id
@@ -61,6 +85,10 @@ function makeViewer(paneId) {
   let action = null;     // 当前播放的 action
   let skinnedCount = 0;  // SkinnedMesh 数量(诊断用)
   const clock = new THREE.Clock();
+  // 框选区域：glTF 世界坐标下的模型中心/半尺寸(frameObject 时记录，未重定心前的世界 AABB)
+  const modelCenter = new THREE.Vector3();
+  const modelHalf = new THREE.Vector3(1, 1, 1);
+  let regionHelper = null;  // 场景空间(已重定心)里的框线 Box3Helper
 
   function resize() {
     const w = pane.clientWidth, h = pane.clientHeight;
@@ -75,6 +103,9 @@ function makeViewer(paneId) {
     const box = new THREE.Box3().setFromObject(obj);
     const size = box.getSize(new THREE.Vector3());
     const center = box.getCenter(new THREE.Vector3());
+    /* 记录 glTF 世界坐标下的中心/半尺寸(重定心前)，供框选区域换算回 glTF 世界坐标 */
+    modelCenter.copy(center);
+    modelHalf.set(Math.max(size.x/2, 1e-6), Math.max(size.y/2, 1e-6), Math.max(size.z/2, 1e-6));
     const maxDim = Math.max(size.x, size.y, size.z) || 1;
     obj.position.sub(center);                 // 居中
     const dist = maxDim * 2.2;
@@ -169,6 +200,23 @@ function makeViewer(paneId) {
     };
   }
 
+  /* 更新/显示框选区域线框。入参为“模型归一化”坐标：
+   *   c* ∈ 中心偏移(以模型半尺寸为单位，0=模型中心)；s* ∈ 半尺寸(以模型半尺寸为单位)。
+   * 线框画在已重定心的场景空间(模型中心=场景原点)，故场景坐标 = 归一化 × modelHalf。 */
+  function updateRegionBox(on, cx, cy, cz, sx, sy, sz) {
+    if (regionHelper) { scene.remove(regionHelper); regionHelper = null; }
+    if (!on) return;
+    const ccx = cx*modelHalf.x, ccy = cy*modelHalf.y, ccz = cz*modelHalf.z;
+    const hx = Math.max(sx*modelHalf.x, 1e-6), hy = Math.max(sy*modelHalf.y, 1e-6), hz = Math.max(sz*modelHalf.z, 1e-6);
+    const b = new THREE.Box3(
+      new THREE.Vector3(ccx-hx, ccy-hy, ccz-hz),
+      new THREE.Vector3(ccx+hx, ccy+hy, ccz+hz));
+    regionHelper = new THREE.Box3Helper(b, 0x00ff88);
+    scene.add(regionHelper);
+  }
+  const getModelCenter = () => modelCenter.clone();
+  const getModelHalf = () => modelHalf.clone();
+
   function animate() {
     requestAnimationFrame(animate);
     // 同步模式下时间由外部统一驱动(setAnimTime)，这里不再自增
@@ -178,7 +226,8 @@ function makeViewer(paneId) {
   }
   animate();
 
-  return { setModel, clear, applyDisplayOpts, controls, camera, renderer, playClip, clipNames, getAnimInfo, setAnimTime };
+  return { setModel, clear, applyDisplayOpts, controls, camera, renderer, playClip, clipNames, getAnimInfo, setAnimTime,
+           updateRegionBox, getModelCenter, getModelHalf };
 }
 
 function computeStats(root, gltf) {
@@ -247,6 +296,7 @@ function loadOriginal(arrayBuffer, name) {
     $('spinL').style.display = 'none';
     URL.revokeObjectURL(url);
     refreshAnimControl();
+    refreshRegionBox();   // 模型尺寸变化后，按新模型重画框线
   }, undefined, err => {
     $('spinL').style.display = 'none';
     $('msgL').style.display = 'flex';
@@ -276,6 +326,10 @@ async function convert() {
         morphLockRatio: params.morphLockRatio,
         morphLockMaxPct: params.morphLockMaxPct,
         animError: params.animError,
+        staticRatio: params.staticRatio,
+        region: computeRegionArg(),               // null=未启用框选
+        regionMode: params.regionMode,
+        regionRatio: params.regionRatio,
       }),
     });
     const data = await resp.json();
@@ -359,6 +413,24 @@ fMorph.add(params, 'morphLockRatio', 0.0005, 0.08, 0.0005).name('morph 锁定阈
 fMorph.add(params, 'morphLockMaxPct', 0.1, 0.95, 0.05).name('锁定占比上限').onFinishChange(scheduleConvert);
 fMorph.add(params, 'animError', 0.001, 0.1, 0.001).name('动画减面误差').onFinishChange(scheduleConvert);
 fMorph.open();
+
+/* 静态额外压缩 + 框选区域减面 */
+const fRegion = gui.addFolder('静态 / 框选区域减面');
+fRegion.add(params, 'staticRatio', 0.05, 1.0, 0.05).name('非动画件额外压缩(1=不压)').onFinishChange(scheduleConvert);
+fRegion.add(params, 'regionEnable').name('启用框选区域').onChange(() => { refreshRegionBox(); scheduleConvert(); });
+fRegion.add(params, 'regionMode', ['decimate', 'protect']).name('框内: 减面/保面').onFinishChange(scheduleConvert);
+fRegion.add(params, 'regionRatio', 0.02, 1.0, 0.02).name('框内减面系数(decimate)').onFinishChange(scheduleConvert);
+const fBox = fRegion.addFolder('框(模型归一化: 中心/半尺寸)');
+const boxChange = () => { refreshRegionBox(); };
+fBox.add(params, 'regionCx', -1, 1, 0.02).name('中心X').onChange(boxChange).onFinishChange(scheduleConvert);
+fBox.add(params, 'regionCy', -1, 1, 0.02).name('中心Y').onChange(boxChange).onFinishChange(scheduleConvert);
+fBox.add(params, 'regionCz', -1, 1, 0.02).name('中心Z').onChange(boxChange).onFinishChange(scheduleConvert);
+fBox.add(params, 'regionSx', 0.02, 1, 0.02).name('半尺寸X').onChange(boxChange).onFinishChange(scheduleConvert);
+fBox.add(params, 'regionSy', 0.02, 1, 0.02).name('半尺寸Y').onChange(boxChange).onFinishChange(scheduleConvert);
+fBox.add(params, 'regionSz', 0.02, 1, 0.02).name('半尺寸Z').onChange(boxChange).onFinishChange(scheduleConvert);
+fBox.open();
+fRegion.open();
+
 fConv.add(params, 'autoConvert').name('参数改动自动转换');
 fConv.open();
 

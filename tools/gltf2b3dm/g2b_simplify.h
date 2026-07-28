@@ -191,51 +191,88 @@ static float g2b_prim_diag(const wprim_t *wp){
     return sqrtf(dx*dx+dy*dy+dz*dz);
 }
 
-/* 全场景按"三角形数 × 包围盒尺寸"分配预算减面。
- * 纯按三角形数分配会让又碎又小的零件(螺丝/logo 背板)占用过多预算；
- * 行业做法按屏幕覆盖(≈投影面积≈尺寸)加权，大件保面、小件砍狠。 */
+/* prim 世界质心是否落在框选 AABB 内 */
+static int g2b_prim_in_region(const wprim_t *wp, const opts_t *o){
+    return wp->wcenter[0]>=o->region_min[0] && wp->wcenter[0]<=o->region_max[0] &&
+           wp->wcenter[1]>=o->region_min[1] && wp->wcenter[1]<=o->region_max[1] &&
+           wp->wcenter[2]>=o->region_min[2] && wp->wcenter[2]<=o->region_max[2];
+}
+
+/* 全场景减面。三种可叠加的驱动：
+ *  1) 全局预算(max_tris)：按"三角形数 × 包围盒对角线"加权分配(大件保面、小件砍狠)。
+ *  2) 静态额外压缩(static_ratio<1)：所有非动画件的目标再乘该系数。
+ *  3) 框选区域(has_region)：质心在框内的件——decimate 模式目标再乘 region_ratio(更狠)，
+ *     protect 模式则完全保面(不减，且不受全局预算削减)。
+ * 无全局预算时(2)(3) 仍可单独驱动减面(基础目标取件自身三角数)。 */
 static void g2b_simplify(g2b_scene_t *sc, uint32_t max_tris, const opts_t *o) {
-    if (max_tris==0 || sc->total_tris<=max_tris) {
-        /* 仍做 cache 优化 */
+    uint32_t total = sc->total_tris;
+    int global   = (max_tris>0 && total>max_tris);
+    int staticr  = (o && o->static_ratio>0.0f && o->static_ratio<1.0f);
+    int regional = (o && o->has_region);
+
+    if (!global && !staticr && !regional) {
+        /* 无任何减面请求：仅 cache 优化 */
         for (uint32_t i=0;i<sc->prim_count;i++){
             wprim_t *p=&sc->prims[i];
-            int keepuv = (p->tex_id>=0) && !(p->mat_flags & 4); /* matcap(bit2) UV 运行时算，不需保 */
+            int keepuv = (p->tex_id>=0) && !(p->mat_flags & 4); /* matcap(bit2) UV 运行时算 */
             int is_anim = (p->joints!=NULL) || (p->morph_count>0);
             g2b_simplify_prim(p, 0, keepuv, is_anim, o, g2b_prim_diag(p));
         }
         return;
     }
-    uint32_t total = sc->total_tris;
 
-    /* 先算每个 prim 的权重 = 三角形数 × 包围盒对角线。蒙皮/morph prim 额外
-       上调权重(×1.5)，避免动画网格被过度削减导致形变质量下降。 */
-    double *w = (double*)malloc(sizeof(double)*(sc->prim_count?sc->prim_count:1));
-    double wsum = 0.0;
+    /* 全局预算权重(仅在有全局预算时计算) */
+    double *w = NULL, wsum = 1.0;
+    if (global){
+        w = (double*)malloc(sizeof(double)*(sc->prim_count?sc->prim_count:1));
+        wsum = 0.0;
+        for (uint32_t i=0;i<sc->prim_count;i++){
+            wprim_t *wp=&sc->prims[i];
+            uint32_t tri = wp->icount/3;
+            float diag = g2b_prim_diag(wp); if (diag<1e-6f) diag=1e-6f;
+            double wi = (double)tri * (double)diag;
+            if ((wp->joints!=NULL)||(wp->morph_count>0)) wi *= 1.5;  /* 动画件保面 */
+            w[i]=wi; wsum+=wi;
+        }
+        if (wsum<1e-12) wsum=1.0;
+    }
+
+    uint32_t new_total=0, nreg=0;
     for (uint32_t i=0;i<sc->prim_count;i++){
         wprim_t *wp=&sc->prims[i];
         uint32_t tri = wp->icount/3;
-        float diag = g2b_prim_diag(wp);
-        if (diag < 1e-6f) diag = 1e-6f;
-        double wi = (double)tri * (double)diag;
-        if ((wp->joints!=NULL) || (wp->morph_count>0)) wi *= 1.5;
-        w[i] = wi; wsum += wi;
-    }
-    if (wsum < 1e-12) wsum = 1.0;
-
-    uint32_t new_total = 0;
-    for (uint32_t i=0;i<sc->prim_count;i++) {
-        wprim_t *wp=&sc->prims[i];
-        uint32_t tri = wp->icount/3;
-        uint32_t budget = (uint32_t)((double)max_tris * (w[i]/wsum));
-        if (budget<1) budget=1;
-        if (budget>tri) budget=tri;   /* 不为小件分配超过自身的预算 */
-        int keepuv = (wp->tex_id>=0) && !(wp->mat_flags & 4); /* matcap UV 运行时算 */
         int is_anim = (wp->joints!=NULL) || (wp->morph_count>0);
+        int keepuv  = (wp->tex_id>=0) && !(wp->mat_flags & 4);
+        int inreg   = regional ? g2b_prim_in_region(wp,o) : 0;
+
+        /* protect：框内件保面，跳过减面(不受全局预算削减) */
+        if (regional && o->region_mode==1 && inreg){
+            g2b_simplify_prim(wp, 0, keepuv, is_anim, o, g2b_prim_diag(wp));
+            new_total += wp->icount/3; nreg++;
+            continue;
+        }
+
+        /* 基础目标：有全局预算按尺寸加权；否则为件自身三角数 */
+        double target = global ? ((double)max_tris * (w[i]/wsum)) : (double)tri;
+        if (staticr && !is_anim) target *= o->static_ratio;                    /* 静态额外压 */
+        if (regional && o->region_mode==0 && inreg){ target *= o->region_ratio; nreg++; } /* 框内加压 */
+
+        uint32_t budget = (uint32_t)(target+0.5);
+        if (budget<1) budget=1;
+        if (budget>=tri) budget=0;   /* 目标不小于自身 → 不减，仅 cache 优化 */
         g2b_simplify_prim(wp, budget, keepuv, is_anim, o, g2b_prim_diag(wp));
         new_total += wp->icount/3;
     }
-    free(w);
+    if (w) free(w);
     sc->total_tris = new_total;
-    fprintf(stderr,"减面: %u → %u 三角形 (预算 %u，按尺寸加权)\n", total, new_total, max_tris);
+
+    if (regional)
+        fprintf(stderr,"减面: %u → %u 三角形 (%s；框内件 %u，%s%s)\n",
+                total, new_total, global?"含全局预算":"仅区域/静态", nreg,
+                o->region_mode==1?"protect 保面":"decimate 加压",
+                staticr?"，静态额外压缩":"");
+    else
+        fprintf(stderr,"减面: %u → %u 三角形 (预算 %u，按尺寸加权%s)\n",
+                total, new_total, max_tris, staticr?"，静态额外压缩":"");
 }
 #endif

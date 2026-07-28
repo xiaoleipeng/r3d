@@ -31,6 +31,13 @@ typedef struct {
     float morph_lock_ratio;   /* morph 顶点形变活跃度阈值(×包围盒对角线)，超过则锁定 */
     float morph_lock_max_pct; /* morph 锁定顶点占比上限(0..1)，防过锁减不动 */
     float anim_error;         /* 动画网格(蒙皮/morph)减面误差阈值 */
+    /* 静态额外压缩：对所有非动画 prim 的减面目标再乘该系数(<1 更狠)。默认 1=不额外压。 */
+    float static_ratio;
+    /* 框选区域减面(世界坐标 AABB)：对质心落在框内的 prim 单独处理。 */
+    int   has_region;         /* 是否设置了区域框 */
+    int   region_mode;        /* 0=decimate(框内更狠) 1=protect(框内保面) */
+    float region_ratio;       /* decimate 模式下框内 prim 目标再乘该系数(默认 0.3) */
+    float region_min[3], region_max[3];
 } opts_t;
 
 /* 材质/纹理输出模式（行业惯例的材质降级谱系）*/
@@ -59,7 +66,11 @@ static void usage(const char *p) {
       "                    solid=每件贴图平均色单色; none=统一中灰\n"
       "  --morph-lock-ratio R   morph 形变位移>R×包围盒的顶点锁定(默认 0.002)\n"
       "  --morph-lock-max-pct P morph 锁定顶点占比上限(默认 0.4)\n"
-      "  --anim-error E         蒙皮/morph 减面误差阈值(默认 0.01)\n", p);
+      "  --anim-error E         蒙皮/morph 减面误差阈值(默认 0.01)\n"
+      "  --static-ratio S       非动画件减面目标再乘 S(<1 更狠，默认 1=不额外压)\n"
+      "  --region \"x0,y0,z0,x1,y1,z1\"  世界坐标框选区域(AABB)，对质心在框内的件单独处理\n"
+      "  --region-mode M        decimate(框内更狠，默认)|protect(框内保面)\n"
+      "  --region-ratio R       decimate 模式下框内件目标再乘 R(默认 0.3)\n", p);
 }
 
 static int parse_opts(int argc, char **argv, opts_t *o) {
@@ -71,6 +82,9 @@ static int parse_opts(int argc, char **argv, opts_t *o) {
     o->morph_lock_ratio = 0.002f;
     o->morph_lock_max_pct = 0.40f;
     o->anim_error = 0.01f;
+    o->static_ratio = 1.0f;
+    o->region_ratio = 0.3f;
+    o->region_mode = 0; /* decimate */
     if (argc < 3) return -1;
     o->input = argv[1];
     o->output = argv[2];
@@ -90,6 +104,28 @@ static int parse_opts(int argc, char **argv, opts_t *o) {
         else if (!strcmp(argv[i], "--morph-lock-ratio") && i+1 < argc) o->morph_lock_ratio = (float)atof(argv[++i]);
         else if (!strcmp(argv[i], "--morph-lock-max-pct") && i+1 < argc) o->morph_lock_max_pct = (float)atof(argv[++i]);
         else if (!strcmp(argv[i], "--anim-error") && i+1 < argc) o->anim_error = (float)atof(argv[++i]);
+        else if (!strcmp(argv[i], "--static-ratio") && i+1 < argc) o->static_ratio = (float)atof(argv[++i]);
+        else if (!strcmp(argv[i], "--region-ratio") && i+1 < argc) o->region_ratio = (float)atof(argv[++i]);
+        else if (!strcmp(argv[i], "--region-mode") && i+1 < argc) {
+            const char *m = argv[++i];
+            if (!strcmp(m, "decimate")) o->region_mode = 0;
+            else if (!strcmp(m, "protect")) o->region_mode = 1;
+            else { fprintf(stderr, "未知 region-mode: %s\n", m); return -1; }
+        }
+        else if (!strcmp(argv[i], "--region") && i+1 < argc) {
+            /* "x0,y0,z0,x1,y1,z1" → 归一化为 min/max */
+            float v[6] = {0};
+            if (sscanf(argv[++i], "%f,%f,%f,%f,%f,%f",
+                       &v[0],&v[1],&v[2],&v[3],&v[4],&v[5]) != 6) {
+                fprintf(stderr, "--region 需要 6 个逗号分隔的数: x0,y0,z0,x1,y1,z1\n");
+                return -1;
+            }
+            for (int k=0;k<3;k++){
+                o->region_min[k] = v[k] < v[k+3] ? v[k] : v[k+3];
+                o->region_max[k] = v[k] < v[k+3] ? v[k+3] : v[k];
+            }
+            o->has_region = 1;
+        }
         else { fprintf(stderr, "未知选项: %s\n", argv[i]); return -1; }
     }
     return 0;
@@ -111,6 +147,7 @@ typedef struct {
     int       node_id;       /* 所属 node 索引 */
     int       is_dynamic;    /* 被动画驱动(不烘焙节点变换) */
     uint32_t *vcolor;        /* [vcount] 逐顶点烘焙色 ARGB，NULL=无(baked-vertex 模式生成) */
+    float     wcenter[3];    /* 世界坐标质心(框选区域减面用；静态=世界、动态=wm×局部质心) */
 } wprim_t;
 
 /* ---- oct 法线编码 ---- */

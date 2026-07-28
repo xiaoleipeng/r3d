@@ -102,6 +102,10 @@ typedef struct {
     uint64_t            perf_deform_sum;  /* 变形累计耗时 */
     uint32_t            perf_deform_max;  /* 变形单帧峰值 */
 
+    /* 上一帧的翻页(FBIOPAN_DISPLAY)耗时(微秒)。翻页发生在 end_frame 之后，
+     * 本帧的还未知，故按 1 帧延迟随下一帧的 perf_frame_mark 上报。 */
+    long                prev_pan_us;
+
     /* 渲染后端 */
     r3d_backend_t      *be;
 } r3d_engine_ctx_t;
@@ -477,6 +481,12 @@ r3d_engine_handle r3d_engine_load_file(const char *path)
         syslog(LOG_ERR, "%s: r3d_model_load(%s) failed\n", LOG_TAG, path);
         return NULL;
     }
+    /* 性能：为新模型分段——后端会转储上一个模型残留帧、打印 syslog 模型标记、
+     * 并把帧号/缓冲/统计窗口清零，使每个 b3dm 逐帧数据自成一段(离线可精确分类)。 */
+    if (g_ctx->be->vt->perf_model_begin) {
+        const char *base = strrchr(path, '/');
+        g_ctx->be->vt->perf_model_begin(g_ctx->be, base ? base + 1 : path);
+    }
     return make_instance(model);
 }
 
@@ -534,14 +544,19 @@ int r3d_engine_render_frame(r3d_engine_handle handle, float elapsed)
     if (trace) R3D_TRACE("render_frame #%u begin (elapsed=%d ms)",
                          (unsigned)ctx->frame_no, (int)(elapsed * 1000.0f));
 
-    /* 双缓冲：等待空闲缓冲 */
+    /* 引擎侧逐帧各阶段耗时(微秒)，帧末经 perf_frame_mark 上报后端。 */
+    long wait_us = 0, anim_us = 0, node_us = 0;
+
+    /* 双缓冲：等待空闲缓冲(vsync 相关空闲等待，非 CPU 工作) */
     if (ctx->double_buffer) {
         if (trace) R3D_TRACE("  [1] poll(POLLOUT) wait free buffer...");
         struct pollfd pfds[1];
         memset(pfds, 0, sizeof(pfds));
         pfds[0].fd = ctx->fb_fd;
         pfds[0].events = POLLOUT;
+        long wt0 = r3d_now_us();
         poll(pfds, 1, -1);
+        wait_us = r3d_now_us() - wt0;
         if (trace) R3D_TRACE("  [1] poll done");
     }
 
@@ -573,7 +588,11 @@ int r3d_engine_render_frame(r3d_engine_handle handle, float elapsed)
     /* model 矩阵：动画驱动 root，否则单位 */
     r3d_mat4_t model;
     r3d_mat4_identity(&model);
-    if (a->animated) r3d_anim_update(&a->ast, elapsed);
+    if (a->animated) {
+        long at0 = r3d_now_us();
+        r3d_anim_update(&a->ast, elapsed);
+        anim_us = r3d_now_us() - at0;
+    }
     if (a->animated && m->node_count <= 1) model = a->ast.root_matrix;
 
     /* 顶点变形：skin 优先于 morph */
@@ -628,11 +647,6 @@ int r3d_engine_render_frame(r3d_engine_handle handle, float elapsed)
         }
     }
 
-    /* 把引擎侧测得的变形耗时喂给后端，并入后端统一的逐帧原始性能记录与串口转储。
-     * 后端不支持时该指针为 NULL，判空跳过。 */
-    if (ctx->be->vt->perf_frame_mark)
-        ctx->be->vt->perf_frame_mark(ctx->be, deform_us);
-
     /* 两趟：先不透明，后半透明 */
     uint32_t submitted = 0;
     if (trace) R3D_TRACE("  [5] draw submeshes (sm=%u)", (unsigned)m->submesh_count);
@@ -659,8 +673,11 @@ int r3d_engine_render_frame(r3d_engine_handle handle, float elapsed)
             mat.base_color_factor = sm->base_color_factor;
 
             r3d_mat4_t smodel = model;
-            if ((sm->mat_flags & R3D_MAT_DYNAMIC_NODE) && a->animated)
+            if ((sm->mat_flags & R3D_MAT_DYNAMIC_NODE) && a->animated) {
+                long nt0 = r3d_now_us();
                 r3d_anim_node_matrix(m, &a->ast, sm->node_id, &smodel);
+                node_us += r3d_now_us() - nt0;   /* 逐 submesh 累计 */
+            }
 
             ctx->be->vt->draw(ctx->be, &mesh, &smodel, &mat);
             submitted++;
@@ -668,11 +685,25 @@ int r3d_engine_render_frame(r3d_engine_handle handle, float elapsed)
     }
     if (trace) R3D_TRACE("  [5] draw done (%u submeshes submitted)", (unsigned)submitted);
 
+    /* 把引擎侧各阶段耗时喂给后端，并入后端统一的逐帧原始性能记录与串口转储。
+     * 此处 wait/anim/node/deform 均已知；pan 用上一帧的值(本帧翻页在 end_frame
+     * 之后才发生)。后端不支持时该指针为 NULL，判空跳过。 */
+    if (ctx->be->vt->perf_frame_mark) {
+        r3d_engine_perf_t ep;
+        ep.wait_us   = wait_us;
+        ep.anim_us   = anim_us;
+        ep.node_us   = node_us;
+        ep.deform_us = deform_us;
+        ep.pan_us    = ctx->prev_pan_us;
+        ctx->be->vt->perf_frame_mark(ctx->be, &ep);
+    }
+
     if (trace) R3D_TRACE("  [6] end_frame (GPU flush/finish)...");
     ctx->be->vt->end_frame(ctx->be);
     if (trace) R3D_TRACE("  [6] end_frame done");
 
-    /* 翻页上屏 */
+    /* 翻页上屏(计时，供下一帧上报) */
+    long pt0 = r3d_now_us();
     if (ctx->double_buffer) {
         ctx->pinfo.yoffset = (back == 0) ? 0 : ctx->mem2_yoffset;
         ioctl(ctx->fb_fd, FBIOPAN_DISPLAY, (unsigned long)(uintptr_t)&ctx->pinfo);
@@ -680,6 +711,7 @@ int r3d_engine_render_frame(r3d_engine_handle handle, float elapsed)
     } else {
         ioctl(ctx->fb_fd, FBIOPAN_DISPLAY, (unsigned long)(uintptr_t)&ctx->pinfo);
     }
+    ctx->prev_pan_us = r3d_now_us() - pt0;
     if (trace) R3D_TRACE("  [7] pan display done, frame #%u end", (unsigned)ctx->frame_no);
     ctx->frame_no++;
     return R3D_ENGINE_OK;

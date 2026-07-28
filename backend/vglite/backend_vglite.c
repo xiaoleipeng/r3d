@@ -87,14 +87,22 @@ static void vgl_ts_add(vgl_timestat_t *s, long us)
  * 行的字段顺序、离线工具解析顺序三者必须保持一致。 */
 typedef struct {
     uint32_t frame;        /* 全局帧序号(单调递增) */
-    uint32_t t_frame;      /* 整帧 CPU 墙钟 */
-    uint32_t gpu;          /* vg_lite_finish 等待 GPU */
-    uint32_t deform;       /* 引擎侧 CPU 变形(morph/skin)，经 perf_frame_mark 传入 */
-    uint32_t collect;      /* vgl_draw 收集累计 */
+    uint32_t t_frame;      /* 整帧 CPU 墙钟(begin_frame→end_frame) */
+    uint32_t wait;         /* 引擎侧：双缓冲 poll 等空闲缓冲(vsync 空闲，非工作) */
+    uint32_t anim;         /* 引擎侧：r3d_anim_update 关键帧采样+混合 */
+    uint32_t node;         /* 引擎侧：逐 submesh r3d_anim_node_matrix 累计 */
+    uint32_t deform;       /* 引擎侧：CPU 变形(morph/skin) */
+    uint32_t collect;      /* vgl_draw 收集累计(投影+剔除+光照) */
     uint32_t sort;         /* 画家算法排序 */
-    uint32_t submit;       /* 命令缓冲构建 */
+    uint32_t submit;       /* 命令缓冲构建(= sbuild + sdraw + sflush) */
+    uint32_t sbuild;       /* submit 细分：CPU 建 path(顶点/bbox/仿射) */
+    uint32_t sdraw;        /* submit 细分：vg_lite_draw/draw_pattern 调用 */
+    uint32_t sflush;       /* submit 细分：周期 vg_lite_flush */
+    uint32_t gpu;          /* vg_lite_finish 残余等待(非 GPU 利用率，见注释) */
+    uint32_t pan;          /* 引擎侧：上一帧 FBIOPAN_DISPLAY 翻页 */
     uint32_t tris;         /* 提交绘制三角形数(kept) */
     uint32_t drawcalls;    /* draw call 次数 */
+    uint32_t tex;          /* 纹理绑定次数(draw_pattern) */
 } vgl_raw_rec_t;
 
 /* ---------------- 内部数据 ---------------- */
@@ -135,6 +143,24 @@ typedef struct {
  *   头部行： r3d_perfraw: HDR ...
  *   逐帧行： r3d_perfraw: F <字段...> */
 #define VGL_PERF_RAW_TAG          "r3d_perfraw"
+
+/* submit 阶段细分(path 构建 / vg_lite_draw 调用 / flush)。submit 通常是本后端
+ * 最大头，细分能区分“成本在我们建 path 还是 driver 的 draw 调用”。代价是每三角形
+ * 多几次 clock_gettime(每帧 ~2×三角形数)，故用编译开关控制；置 0 可完全编出、
+ * 回到单一 submit 计时。默认开启。 */
+#ifndef R3D_PERF_SUBMIT_DETAIL
+#define R3D_PERF_SUBMIT_DETAIL 1
+#endif
+
+/* submit 细分计时的取时/累加宏。关闭时不产生任何 clock_gettime 调用，
+ * 三个细分值恒为 0(submit 总数仍准确)。 */
+#if R3D_PERF_SUBMIT_DETAIL
+#define VGL_SUBMIT_T0()         vgl_now_us()
+#define VGL_SUBMIT_ADD(acc, t0) do { (acc) += vgl_now_us() - (t0); } while (0)
+#else
+#define VGL_SUBMIT_T0()         (0L)
+#define VGL_SUBMIT_ADD(acc, t0) do { (void)(t0); } while (0)
+#endif
 
 /* 合批潜力分析：对若干感知量化档(每通道右移位数)，统计"若把画家序中相邻、
  * 量化后同色的 tex=0 三角形合并为一次 draw，则本帧实际 draw call 数"。
@@ -273,8 +299,13 @@ typedef struct {
     /* ---- 合批潜力秒窗口统计：各量化档下"合批后 draw call"的累加(算每帧均值) ---- */
     uint64_t stat_batch_sum[VGL_BATCH_NLEVELS];
 
-    /* ---- 引擎经 perf_frame_mark 传入的当帧变形耗时(end_frame 消费后清零) ---- */
-    long     deform_us_pending;
+    /* ---- 引擎经 perf_frame_mark 传入的当帧各阶段耗时(end_frame 消费后清零) ---- */
+    r3d_engine_perf_t eng_perf_pending;
+    int               eng_perf_valid;   /* 本帧引擎是否已上报(未报则记 0) */
+
+    /* ---- 新增阶段的秒窗口累加(简单求和算平均；稳健分位数交给离线工具) ---- */
+    uint64_t stat_wait_sum, stat_anim_sum, stat_node_sum, stat_pan_sum;
+    uint64_t stat_sbuild_sum, stat_sdraw_sum, stat_sflush_sum;
 
     /* ---- 原始逐帧采集：环形缓冲 + 定期串口转储 ---- */
     vgl_raw_rec_t *raw_ring;        /* 定长环形缓冲(init 一次性分配) */
@@ -409,7 +440,8 @@ static r3d_result_t vgl_init(r3d_backend_t *self, const r3d_backend_cfg_t *cfg)
     im->raw_head = im->raw_filled = 0;
     im->raw_dump_ms = vgl_now_ms();
     im->global_frame = 0;
-    im->deform_us_pending = 0;
+    memset(&im->eng_perf_pending, 0, sizeof(im->eng_perf_pending));
+    im->eng_perf_valid = 0;
 
     return R3D_OK;
 }
@@ -832,44 +864,65 @@ static vg_lite_blend_t to_vgl_blend(int blend, int translucent)
     }
 }
 
-/* 引擎每帧变形后调用：把引擎侧测得的变形耗时(微秒)暂存，
+/* 引擎每帧绘制提交前调用：把引擎侧测得的各阶段耗时暂存，
  * end_frame 时写入当帧原始记录后清零。 */
-static void vgl_perf_frame_mark(r3d_backend_t *self, long deform_us)
+static void vgl_perf_frame_mark(r3d_backend_t *self, const r3d_engine_perf_t *ep)
 {
     vgl_impl_t *im = (vgl_impl_t *)self->impl;
-    im->deform_us_pending = deform_us;
+    if (ep) {
+        im->eng_perf_pending = *ep;
+        im->eng_perf_valid = 1;
+    }
 }
 
-/* 把一帧的原始测量值写入环形缓冲(O(1)，覆盖最旧)。 */
+/* 非负截断为 uint32(微秒)。 */
+static inline uint32_t vgl_u32(long v) { return (uint32_t)(v < 0 ? 0 : v); }
+
+/* 把一帧的原始测量值写入环形缓冲(O(1)，覆盖最旧)。
+ * 后端侧耗时(t_frame/gpu/collect/sort/submit + submit 细分)由调用方传入；
+ * 引擎侧阶段(wait/anim/node/deform/pan)从 eng_perf_pending 取；计数从 im 取。 */
 static void vgl_raw_record(vgl_impl_t *im, uint32_t t_frame, uint32_t gpu,
                            uint32_t collect, uint32_t sort, uint32_t submit,
+                           uint32_t sbuild, uint32_t sdraw, uint32_t sflush,
                            uint32_t tris, uint32_t drawcalls)
 {
     if (!im->raw_ring) return;
+    const r3d_engine_perf_t *ep = &im->eng_perf_pending;
     vgl_raw_rec_t *r = &im->raw_ring[im->raw_head];
     r->frame     = im->global_frame;
     r->t_frame   = t_frame;
-    r->gpu       = gpu;
-    r->deform    = (uint32_t)(im->deform_us_pending < 0 ? 0 : im->deform_us_pending);
+    r->wait      = vgl_u32(ep->wait_us);
+    r->anim      = vgl_u32(ep->anim_us);
+    r->node      = vgl_u32(ep->node_us);
+    r->deform    = vgl_u32(ep->deform_us);
     r->collect   = collect;
     r->sort      = sort;
     r->submit    = submit;
+    r->sbuild    = sbuild;
+    r->sdraw     = sdraw;
+    r->sflush    = sflush;
+    r->gpu       = gpu;
+    r->pan       = vgl_u32(ep->pan_us);
     r->tris      = tris;
     r->drawcalls = drawcalls;
+    r->tex       = im->tex_binds;
 
     im->raw_head = (im->raw_head + 1) % VGL_PERF_RING_FRAMES;
     if (im->raw_filled < VGL_PERF_RING_FRAMES) im->raw_filled++;
     im->global_frame++;
-    im->deform_us_pending = 0;   /* 消费掉，避免下一帧引擎未调用时误用旧值 */
+    /* 消费掉引擎侧数据，避免下一帧引擎未调用时误用旧值。 */
+    memset(&im->eng_perf_pending, 0, sizeof(im->eng_perf_pending));
+    im->eng_perf_valid = 0;
 }
 
 /* 每 N 秒把环形缓冲里的原始逐帧数据批量转储到串口/syslog。
  * 一次性批量输出(非逐帧内联)，转储后清空缓冲以复用；调用时机在 end_frame 末尾
  * (帧与帧之间)，把批量 I/O 突发局限在窗口边界。
- * 格式(离线工具 tools/perf/r3d_perf_analyze.py 解析)：
- *   头部： r3d_perfraw: HDR n=<帧数> budget_us=16667 fields=frame,t_frame,gpu,deform,collect,sort,submit,tris,drawcalls
- *   逐帧： r3d_perfraw: F <frame> <t_frame> <gpu> <deform> <collect> <sort> <submit> <tris> <drawcalls>
- *   结尾： r3d_perfraw: END */
+ * 格式(离线工具 tools/perf/r3d_perf_analyze.py 解析；列由 HDR 的 fields= 动态决定)：
+ *   头部： r3d_perfraw: HDR n=<帧数> budget_us=16667 fields=frame,t_frame,wait,anim,node,deform,collect,sort,submit,sbuild,sdraw,sflush,gpu,pan,tris,drawcalls,tex
+ *   逐帧： r3d_perfraw: F <上述字段顺序的 17 个值>
+ *   结尾： r3d_perfraw: END
+ * 注：gpu 为 vg_lite_finish 残余等待，非 GPU 利用率(flush 使 GPU 与 submit 并行)。 */
 static void vgl_raw_dump(vgl_impl_t *im)
 {
     if (!im->raw_ring || im->raw_filled == 0) return;
@@ -878,23 +931,50 @@ static void vgl_raw_dump(vgl_impl_t *im)
     /* 最旧样本的起点：缓冲未满时为 0，满时为 head(即将被覆盖的最旧位置)。 */
     uint32_t start = (im->raw_filled < VGL_PERF_RING_FRAMES) ? 0 : im->raw_head;
 
-    VGL_LOG("%s: HDR n=%u budget_us=%d fields=frame,t_frame,gpu,deform,"
-            "collect,sort,submit,tris,drawcalls",
+    VGL_LOG("%s: HDR n=%u budget_us=%d fields=frame,t_frame,wait,anim,node,"
+            "deform,collect,sort,submit,sbuild,sdraw,sflush,gpu,pan,"
+            "tris,drawcalls,tex",
             VGL_PERF_RAW_TAG, (unsigned)n, VGL_PERF_BUDGET_US);
 
     for (uint32_t k = 0; k < n; k++) {
         const vgl_raw_rec_t *r = &im->raw_ring[(start + k) % VGL_PERF_RING_FRAMES];
-        VGL_LOG("%s: F %u %u %u %u %u %u %u %u %u",
+        VGL_LOG("%s: F %u %u %u %u %u %u %u %u %u %u %u %u %u %u %u %u %u",
                 VGL_PERF_RAW_TAG,
-                (unsigned)r->frame, (unsigned)r->t_frame, (unsigned)r->gpu,
-                (unsigned)r->deform, (unsigned)r->collect, (unsigned)r->sort,
-                (unsigned)r->submit, (unsigned)r->tris, (unsigned)r->drawcalls);
+                (unsigned)r->frame, (unsigned)r->t_frame, (unsigned)r->wait,
+                (unsigned)r->anim, (unsigned)r->node, (unsigned)r->deform,
+                (unsigned)r->collect, (unsigned)r->sort, (unsigned)r->submit,
+                (unsigned)r->sbuild, (unsigned)r->sdraw, (unsigned)r->sflush,
+                (unsigned)r->gpu, (unsigned)r->pan,
+                (unsigned)r->tris, (unsigned)r->drawcalls, (unsigned)r->tex);
     }
     VGL_LOG("%s: END", VGL_PERF_RAW_TAG);
 
     /* 转储后清空，下个窗口重新累积(避免相邻窗口重复输出同批帧)。 */
     im->raw_head = im->raw_filled = 0;
     im->raw_dump_ms = vgl_now_ms();
+}
+
+/* 重置每秒统计窗口(汇总输出后、或切换模型时调用)。 */
+static void vgl_window_reset(vgl_impl_t *im)
+{
+    im->stat_window_ms = vgl_now_ms();
+    im->stat_frames = 0;
+    im->stat_tris_sum = im->stat_dc_sum = im->stat_tex_sum = 0;
+    im->stat_tris_min = im->stat_dc_min = im->stat_tex_min = 0xFFFFFFFFu;
+    im->stat_tris_max = im->stat_dc_max = im->stat_tex_max = 0;
+    vgl_ts_reset(&im->st_collect);
+    vgl_ts_reset(&im->st_sort);
+    vgl_ts_reset(&im->st_submit);
+    vgl_ts_reset(&im->st_gpu);
+    vgl_ts_reset(&im->st_frame);
+    im->stat_cull_input_sum = im->stat_cull_oob_sum = im->stat_cull_behind_sum = 0;
+    im->stat_cull_bad_sum = im->stat_cull_back_sum = 0;
+    im->stat_cull_degen_sum = im->stat_cull_capped_sum = 0;
+    im->stat_miss_count = 0;
+    im->stat_worst_over = 0;
+    for (int L = 0; L < VGL_BATCH_NLEVELS; L++) im->stat_batch_sum[L] = 0;
+    im->stat_wait_sum = im->stat_anim_sum = im->stat_node_sum = im->stat_pan_sum = 0;
+    im->stat_sbuild_sum = im->stat_sdraw_sum = im->stat_sflush_sum = 0;
 }
 
 /* 每秒一次输出标准 3D 性能统计：FPS + 三角面/draw call/纹理绑定的
@@ -904,7 +984,8 @@ static void vgl_raw_dump(vgl_impl_t *im)
  * submit=构建 path+入命令缓冲，gpu=vg_lite_finish 等待 GPU，frame=整帧 CPU 墙钟。 */
 static void vgl_stats_tick(vgl_impl_t *im, uint32_t tris, uint32_t dc, uint32_t tex,
                            long collect_us, long sort_us, long submit_us,
-                           long gpu_us, long frame_us)
+                           long gpu_us, long frame_us,
+                           long sbuild_us, long sdraw_us, long sflush_us)
 {
     im->stat_frames++;
     im->stat_tris_sum += tris;
@@ -922,6 +1003,19 @@ static void vgl_stats_tick(vgl_impl_t *im, uint32_t tris, uint32_t dc, uint32_t 
     vgl_ts_add(&im->st_submit,  submit_us);
     vgl_ts_add(&im->st_gpu,     gpu_us);
     vgl_ts_add(&im->st_frame,   frame_us);
+
+    /* 新增阶段秒窗口累加(简单求和算平均)。引擎侧阶段取自本帧待写入的
+     * eng_perf_pending(stats_tick 在 raw_record 之前调用，此时仍有效)。 */
+    im->stat_sbuild_sum += (sbuild_us < 0 ? 0 : (uint64_t)sbuild_us);
+    im->stat_sdraw_sum  += (sdraw_us  < 0 ? 0 : (uint64_t)sdraw_us);
+    im->stat_sflush_sum += (sflush_us < 0 ? 0 : (uint64_t)sflush_us);
+    {
+        const r3d_engine_perf_t *ep = &im->eng_perf_pending;
+        im->stat_wait_sum += (ep->wait_us < 0 ? 0 : (uint64_t)ep->wait_us);
+        im->stat_anim_sum += (ep->anim_us < 0 ? 0 : (uint64_t)ep->anim_us);
+        im->stat_node_sum += (ep->node_us < 0 ? 0 : (uint64_t)ep->node_us);
+        im->stat_pan_sum  += (ep->pan_us  < 0 ? 0 : (uint64_t)ep->pan_us);
+    }
 
     /* Deadline-Miss：基于 t_frame(引擎工作墙钟) vs 预算，非受限交付 fps。 */
     if (frame_us > VGL_PERF_BUDGET_US) {
@@ -970,6 +1064,20 @@ static void vgl_stats_tick(vgl_impl_t *im, uint32_t tris, uint32_t dc, uint32_t 
             (unsigned)(im->st_submit.sum / nf), (unsigned)im->st_submit.max,
             (unsigned)(im->st_gpu.sum / nf), (unsigned)im->st_gpu.max);
 
+    /* 补充阶段(avg，微秒)：submit 细分(建 path/draw 调用/flush) + 引擎侧
+     * (wait/anim/node/pan)。submit 细分可判断 submit 成本在我们建 path 还是
+     * driver 的 draw 调用；wait 为 vsync 空闲等待(非工作)。注：gpu 为
+     * vg_lite_finish 残余等待，非 GPU 利用率(flush 使其与 submit 并行)。 */
+    VGL_LOG("perf-time2(us): submit[build avg=%u draw avg=%u flush avg=%u] | "
+            "wait avg=%u anim avg=%u node avg=%u pan avg=%u",
+            (unsigned)(im->stat_sbuild_sum / nf),
+            (unsigned)(im->stat_sdraw_sum / nf),
+            (unsigned)(im->stat_sflush_sum / nf),
+            (unsigned)(im->stat_wait_sum / nf),
+            (unsigned)(im->stat_anim_sum / nf),
+            (unsigned)(im->stat_node_sum / nf),
+            (unsigned)(im->stat_pan_sum / nf));
+
     /* Deadline-Miss(截止期错失)：对硬性 60fps 目标最可执行的指标——
      * 本秒有多少帧的 t_frame 超过 16667us 预算，及最坏超出量。 */
     VGL_LOG("perf-miss: budget60=16667 miss=%u/%u (%u%%) worst_over=%uus",
@@ -1005,22 +1113,27 @@ static void vgl_stats_tick(vgl_impl_t *im, uint32_t tris, uint32_t dc, uint32_t 
             (unsigned)(im->stat_batch_sum[3] / nf));
 
     /* 重置窗口 */
-    im->stat_window_ms = now;
-    im->stat_frames = 0;
-    im->stat_tris_sum = im->stat_dc_sum = im->stat_tex_sum = 0;
-    im->stat_tris_min = im->stat_dc_min = im->stat_tex_min = 0xFFFFFFFFu;
-    im->stat_tris_max = im->stat_dc_max = im->stat_tex_max = 0;
-    vgl_ts_reset(&im->st_collect);
-    vgl_ts_reset(&im->st_sort);
-    vgl_ts_reset(&im->st_submit);
-    vgl_ts_reset(&im->st_gpu);
-    vgl_ts_reset(&im->st_frame);
-    im->stat_cull_input_sum = im->stat_cull_oob_sum = im->stat_cull_behind_sum = 0;
-    im->stat_cull_bad_sum = im->stat_cull_back_sum = 0;
-    im->stat_cull_degen_sum = im->stat_cull_capped_sum = 0;
-    im->stat_miss_count = 0;
-    im->stat_worst_over = 0;
-    for (int L = 0; L < VGL_BATCH_NLEVELS; L++) im->stat_batch_sum[L] = 0;
+    vgl_window_reset(im);
+}
+
+/* 切换/载入新模型：先转储上一个模型残留帧(归属上一个模型)，打印模型标记，
+ * 再把帧号清零、清空环形缓冲与统计窗口，使每个 b3dm 逐帧数据自成一段。 */
+static void vgl_perf_model_begin(r3d_backend_t *self, const char *name)
+{
+    vgl_impl_t *im = (vgl_impl_t *)self->impl;
+    if (!im) return;
+    /* 上一个模型还没到 5s 转储点的尾帧：先转出来(出现在新标记之前 → 归上一个模型)。
+     * vgl_raw_dump 内部会清空 ring 并复位 raw_dump_ms。 */
+    if (im->raw_filled > 0) vgl_raw_dump(im);
+    /* syslog 同流打印模型标记(与逐帧转储同一路，顺序可靠，离线工具据此精确分段)。 */
+    VGL_LOG("perf model=%s", name ? name : "?");
+    /* 新模型从头计数、清空缓冲与统计窗口。 */
+    im->global_frame = 0;
+    im->raw_head = im->raw_filled = 0;
+    im->raw_dump_ms = vgl_now_ms();
+    vgl_window_reset(im);
+    im->eng_perf_valid = 0;
+    memset(&im->eng_perf_pending, 0, sizeof(im->eng_perf_pending));
 }
 
 /* 合批潜力估算：给定画家序(排序索引)，对某量化档(shift)统计合批后 draw call 数。
@@ -1078,10 +1191,10 @@ static void vgl_end_frame(r3d_backend_t *self)
         }
         vgl_stats_tick(im, 0, 0, 0,
                        im->collect_us_accum, 0, 0, gpu_us,
-                       vgl_now_us() - im->frame_begin_us);
+                       vgl_now_us() - im->frame_begin_us, 0, 0, 0);
         vgl_raw_record(im, (uint32_t)(vgl_now_us() - im->frame_begin_us),
                        (uint32_t)gpu_us, (uint32_t)im->collect_us_accum,
-                       0, 0, 0, 0);
+                       0, 0, 0, 0, 0, 0, 0);
         if (vgl_now_ms() - im->raw_dump_ms >= VGL_PERF_DUMP_PERIOD_SEC * 1000)
             vgl_raw_dump(im);
         im->frame_no++;
@@ -1106,12 +1219,18 @@ static void vgl_end_frame(r3d_backend_t *self)
      * VGL_FLUSH_BATCH 次 flush 一次 + 帧末统一 finish。 */
     int pending_draws = 0;
 
+    /* submit 细分累加(微秒)：sbuild=CPU 建 path/bbox/仿射，sdraw=vg_lite_draw
+     * 调用，sflush=周期 flush。R3D_PERF_SUBMIT_DETAIL=0 时恒为 0。 */
+    long sbuild_us = 0, sdraw_us = 0, sflush_us = 0;
+
     long submit_t0 = vgl_now_us();   /* 命令缓冲构建耗时起点(不含末尾 GPU 等待) */
     for (uint32_t i = 0; i < im->tri_count; i++) {
         vgl_tri_t *T = &im->tris[im->sort_idx[i]];   /* 按排序后的索引取三角形 */
 
         vg_lite_path_t *pp = (i < im->vgpaths_cap) ? &im->vgpaths[i] : NULL;
         if (!pp) break;
+
+        long build_t0 = VGL_SUBMIT_T0();   /* build 段起点 */
 
         /* 三角形 path 顶点数据(FP32)：MOVE/LINE/LINE/CLOSE/END = 11 个 4 字节 slot。
          * opcode slot 按 uint32 整数位模式写、坐标 slot 按 IEEE754 float 写。 */
@@ -1152,25 +1271,30 @@ static void vgl_end_frame(r3d_backend_t *self)
 
         vg_lite_blend_t blend = to_vgl_blend(T->blend, T->translucent);
 
+        /* pattern 仿射预解算属于 build 段。 */
+        vg_lite_matrix_t pat_mat;
+        int use_pattern = (T->tex &&
+                           solve_affine(T, T->tex->width, T->tex->height, &pat_mat));
+
+        VGL_SUBMIT_ADD(sbuild_us, build_t0);   /* build 段结束 */
+
+        /* 实际下发 draw 命令(driver 侧成本)。 */
+        long draw_t0 = VGL_SUBMIT_T0();
         vg_lite_error_t derr;
-        if (T->tex) {
-            vg_lite_matrix_t pat_mat;
-            if (solve_affine(T, T->tex->width, T->tex->height, &pat_mat)) {
-                derr = vg_lite_draw_pattern(&im->target, pp, VGL_FILL_RULE,
-                             &path_mat, T->tex, &pat_mat, blend,
-                             VG_LITE_PATTERN_PAD, 0, T->color, VG_LITE_FILTER_BI_LINEAR);
-                im->tex_binds++;
-            } else {
-                derr = vg_lite_draw(&im->target, pp, VGL_FILL_RULE,
-                             &path_mat, blend, T->color);
-            }
+        if (use_pattern) {
+            derr = vg_lite_draw_pattern(&im->target, pp, VGL_FILL_RULE,
+                         &path_mat, T->tex, &pat_mat, blend,
+                         VG_LITE_PATTERN_PAD, 0, T->color, VG_LITE_FILTER_BI_LINEAR);
+            im->tex_binds++;
         } else {
             derr = vg_lite_draw(&im->target, pp, VGL_FILL_RULE,
                          &path_mat, blend, T->color);
         }
+        VGL_SUBMIT_ADD(sdraw_us, draw_t0);
+
         if (derr != VG_LITE_SUCCESS) {
             VGL_ERR("tri[%u] %s ret=%d(%s), abort frame", (unsigned)i,
-                    T->tex ? "vg_lite_draw_pattern" : "vg_lite_draw",
+                    use_pattern ? "vg_lite_draw_pattern" : "vg_lite_draw",
                     (int)derr, vgl_err_str(derr));
             break;
         }
@@ -1178,7 +1302,9 @@ static void vgl_end_frame(r3d_backend_t *self)
 
         /* 批量 flush：每 VGL_FLUSH_BATCH 次 draw flush 一次(不再每个 draw 都 flush)。 */
         if (++pending_draws >= VGL_FLUSH_BATCH) {
+            long flush_t0 = VGL_SUBMIT_T0();
             vg_lite_flush();
+            VGL_SUBMIT_ADD(sflush_us, flush_t0);
             pending_draws = 0;
         }
     }
@@ -1194,11 +1320,13 @@ static void vgl_end_frame(r3d_backend_t *self)
     long frame_us = vgl_now_us() - im->frame_begin_us;
     vgl_stats_tick(im, submit_tris, im->draw_calls, im->tex_binds,
                    im->collect_us_accum, sort_us, submit_us, gpu_us,
-                   frame_us);
+                   frame_us, sbuild_us, sdraw_us, sflush_us);
     /* 原始逐帧记录 + 每 N 秒批量转储(在帧末、帧间发出，把 I/O 突发局限在窗口边界)。 */
     vgl_raw_record(im, (uint32_t)frame_us, (uint32_t)gpu_us,
                    (uint32_t)im->collect_us_accum, (uint32_t)sort_us,
-                   (uint32_t)submit_us, submit_tris, im->draw_calls);
+                   (uint32_t)submit_us,
+                   (uint32_t)sbuild_us, (uint32_t)sdraw_us, (uint32_t)sflush_us,
+                   submit_tris, im->draw_calls);
     if (vgl_now_ms() - im->raw_dump_ms >= VGL_PERF_DUMP_PERIOD_SEC * 1000)
         vgl_raw_dump(im);
     im->frame_no++;
@@ -1238,6 +1366,7 @@ static const r3d_backend_vtable_t VGL_VT = {
     .present         = vgl_present,
     .query_feature   = vgl_query_feature,
     .perf_frame_mark = vgl_perf_frame_mark,
+    .perf_model_begin = vgl_perf_model_begin,
 };
 
 r3d_backend_t *r3d_backend_vglite_create(void)

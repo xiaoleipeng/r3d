@@ -167,6 +167,11 @@ const server = http.createServer((req, res) => {
       if (opt.morphLockRatio != null) args.push('--morph-lock-ratio', String(opt.morphLockRatio));
       if (opt.morphLockMaxPct != null) args.push('--morph-lock-max-pct', String(opt.morphLockMaxPct));
       if (opt.animError != null) args.push('--anim-error', String(opt.animError));
+      // 静态额外压缩 + 框选区域减面
+      if (opt.staticRatio != null) args.push('--static-ratio', String(opt.staticRatio));
+      if (opt.region) args.push('--region', String(opt.region)); // "x0,y0,z0,x1,y1,z1"
+      if (opt.regionMode) args.push('--region-mode', String(opt.regionMode));
+      if (opt.regionRatio != null) args.push('--region-ratio', String(opt.regionRatio));
 
       execFile(TOOL, args, { timeout: 120000, maxBuffer: 16 * 1024 * 1024 }, (e, stdout, stderr) => {
         const toolOutput = (stderr || '') + (stdout || '');

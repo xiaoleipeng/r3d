@@ -320,10 +320,14 @@ int main(int argc,char**argv){
         float a=((bcf>>24)&0xFF)/255.0f,r=((bcf>>16)&0xFF)/255.0f,gg=((bcf>>8)&0xFF)/255.0f,b=(bcf&0xFF)/255.0f;
         int tid=qs?qs[s].tex_id:0xFFFF;
         int ds=qs?(qs[s].mat_flags&1):0;
+        /* 半透明(mat_flags bit3=R3D_MAT_TRANSLUCENT，或 base color alpha<255)需显式
+         * 输出 alphaMode=BLEND，否则 glTF 默认 OPAQUE，three.js 预览会忽略 alpha 把
+         * 玻璃/透明面渲染成不透明、遮住其后的表盘(设备侧靠 TRANSLUCENT 标志本已正确)。 */
+        int tl=qs?((qs[s].mat_flags&8) || (((bcf>>24)&0xFF)<255)):0;
         fprintf(g,"%s{\"pbrMetallicRoughness\":{\"baseColorFactor\":[%g,%g,%g,%g],\"metallicFactor\":0,\"roughnessFactor\":0.8",
             s?",\n":"",r,gg,b,a);
         if(tid!=0xFFFF && (uint32_t)tid<texcnt) fprintf(g,",\"baseColorTexture\":{\"index\":%d}",tid);
-        fprintf(g,"}%s}", ds?",\"doubleSided\":true":"");
+        fprintf(g,"}%s%s}", tl?",\"alphaMode\":\"BLEND\"":"", ds?",\"doubleSided\":true":"");
     }
     fprintf(g,"\n],\n");
 
@@ -362,7 +366,14 @@ int main(int argc,char**argv){
      * 世界矩阵)，若再用 node 树的 TRS 就会二次变换 → 零件错位(如 ferrari 轮子飞出)。
      * 故仅当存在 skin 或 morph(顶点未烘焙、依赖运行时节点/蒙皮变换)时才输出 node 树；
      * 纯静态模型一律走扁平单位 node 路径。 */
-    int need_node_tree = (nodecnt>0) && (has_skin || morph_tc>0);
+    /* 节点动画(无 skin/morph)也需输出 node 树：动态顶点(带 DYNAMIC_NODE 标志的
+     * submesh，如表针)未烘焙，依赖 node 树父链的 rest TRS(例如表针父节点 Hands 的
+     * -90°X 旋转)把局部旋转重定向到表盘平面；走扁平路径会丢掉父链、动画在世界系里
+     * 绕错轴 → 秒针方向不对。且扁平路径下动画通道 target 的是 node 索引，与按 submesh
+     * 排布的扁平节点不对齐，本就无法正确驱动。 */
+    int has_node_anim = (nodecnt>0) && (anim_clipcnt>0);
+    int tree_all = (has_skin || morph_tc>0);   /* 顶点未烘焙：所有 submesh 都挂 node 树 */
+    int need_node_tree = (nodecnt>0) && (tree_all || has_node_anim);
     if(need_node_tree){
         int *node_mesh=(int*)malloc(sizeof(int)*nodecnt);
         for(uint32_t i=0;i<nodecnt;i++) node_mesh[i]=-1;
@@ -371,7 +382,12 @@ int main(int argc,char**argv){
         int extra_n=0;
         for(uint32_t s=0;s<smcnt;s++){
             int nid = qs ? (int)qs[s].node_id : -1;
-            if(nid>=0 && nid<(int)nodecnt){
+            /* 纯节点动画模式：仅动态 submesh(顶点未烘焙)挂到 node 树；静态 submesh 顶点
+             * 已烘焙到世界空间，必须走扁平单位 node，否则会被 node TRS 二次变换而错位。
+             * skin/morph 模式(tree_all)下顶点均未烘焙，仍全部挂树，保持原行为。 */
+            int dynamic = qs ? (qs[s].mat_flags & 16) : 0;  /* R3D_MAT_DYNAMIC_NODE */
+            int attach_tree = tree_all || dynamic;
+            if(attach_tree && nid>=0 && nid<(int)nodecnt){
                 if(node_mesh[nid]<0) node_mesh[nid]=(int)s;
                 else { extra_sm[extra_n]=(int)s; extra_parent[extra_n]=nid; extra_n++; }
             } else { extra_sm[extra_n]=(int)s; extra_parent[extra_n]=-1; extra_n++; }

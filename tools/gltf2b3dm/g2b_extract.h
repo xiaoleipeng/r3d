@@ -379,6 +379,24 @@ static int g2b_extract(cgltf_data *d, const char *gltf_path,
                 }
                 else { wp->verts[i].nx=0.0f; wp->verts[i].ny=0.0f; wp->verts[i].nz=0.0f; }
             }
+            /* 世界质心(框选区域减面用)：静态顶点已烘焙到世界(!skinned 时乘过 wm)，
+             * 动态顶点为局部空间，需再乘 wm 得到世界坐标。 */
+            {
+                double cx=0,cy=0,cz=0;
+                for (uint32_t i=0;i<wp->vcount;i++){
+                    cx+=wp->verts[i].px; cy+=wp->verts[i].py; cz+=wp->verts[i].pz;
+                }
+                if (wp->vcount){ cx/=wp->vcount; cy/=wp->vcount; cz/=wp->vcount; }
+                if (skinned){
+                    float x=(float)cx,y=(float)cy,z=(float)cz;
+                    wp->wcenter[0]=wm[0]*x+wm[4]*y+wm[8]*z+wm[12];
+                    wp->wcenter[1]=wm[1]*x+wm[5]*y+wm[9]*z+wm[13];
+                    wp->wcenter[2]=wm[2]*x+wm[6]*y+wm[10]*z+wm[14];
+                } else {
+                    wp->wcenter[0]=(float)cx; wp->wcenter[1]=(float)cy; wp->wcenter[2]=(float)cz;
+                }
+            }
+
             /* 源是否提供法线(否则下面按面计算 flat 法线) */
             int had_normals = (draco_ok ? (dm.normal!=NULL) : (anrm!=NULL));
             /* 索引 */
