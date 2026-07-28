@@ -138,3 +138,10 @@ ctest --test-dir build        # test_m1 / test_m2
 
 > 设备（NuttX）构建由上层 animengine 工程通过 `CONFIG_R3D` 门控接入，
 > 不使用本目录的 host-only `CMakeLists.txt`。
+
+## 文档
+
+- 📊 [性能分析报告](docs/r3d_report.md) — 由 `tools/perf/r3d_perf.html` 从设备日志导出的逐帧性能分析（帧率、瓶颈分解、各指标统计、自动结论）。
+- [3D glTF 渲染架构](docs/3d_gltf_rendering_architecture.md)
+- [3D glTF 渲染评估](docs/3d_gltf_rendering_evaluation.md)
+- [VGLite 性能调查](docs/vglite_perf_investigation.md)
