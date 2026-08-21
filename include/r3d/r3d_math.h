@@ -26,6 +26,12 @@ float      r3d_vec3_dot(r3d_vec3_t a, r3d_vec3_t b);
 r3d_vec3_t r3d_vec3_normalize(r3d_vec3_t v);
 
 /* 四元数 */
+r3d_quat_t r3d_quat_identity(void);
+r3d_quat_t r3d_quat_from_axis_angle(r3d_vec3_t axis, float angle);
+/* r = a*b：先施加 b 再施加 a。相机增量旋转时后乘 = 绕自身局部轴，前乘 = 绕世界轴。 */
+r3d_quat_t r3d_quat_mul(r3d_quat_t a, r3d_quat_t b);
+r3d_quat_t r3d_quat_normalize(r3d_quat_t q);
+r3d_vec3_t r3d_quat_rotate_vec3(r3d_quat_t q, r3d_vec3_t v);
 r3d_quat_t r3d_quat_slerp(r3d_quat_t a, r3d_quat_t b, float t);
 void       r3d_quat_to_mat4(r3d_mat4_t *out, r3d_quat_t q);
 

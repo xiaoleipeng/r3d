@@ -127,7 +127,13 @@ typedef struct {
     /* orbit 相机 */
     r3d_vec3_t         center;
     float              radius;
-    float              yaw, pitch, dist0, dist;
+    /* 相机姿态用四元数，不再用 yaw/pitch 欧拉角。
+     * 球坐标 + 固定世界 up 在 pitch→±90° 处有两重退化：水平半径 dist*cos(pitch)
+     * 趋 0 使 yaw 失效(万向锁)，且视线与 up 平行使 look_at 的 cross 退化。
+     * 四元数下 eye = center + q*(0,0,dist)、up = q*(0,1,0)，增量按局部轴后乘，
+     * 不存在被偏爱的世界轴，故无锁、无需夹角、可连续越过极点。 */
+    r3d_quat_t         orient;
+    float              dist0, dist;
     int                autospin;
 } r3d_anim_instance_t;
 
@@ -409,8 +415,10 @@ static void setup_camera(r3d_anim_instance_t *a)
     a->center = (r3d_vec3_t){ (bmin[0] + bmax[0]) * 0.5f,
                               (bmin[1] + bmax[1]) * 0.5f,
                               (bmin[2] + bmax[2]) * 0.5f };
-    a->yaw = 0.0f;
-    a->pitch = 0.4f;
+    /* 等价于原来的 yaw=0, pitch=0.4：q = Ry(yaw) * Rx(-pitch) */
+    a->orient = r3d_quat_mul(
+        r3d_quat_from_axis_angle((r3d_vec3_t){0.0f, 1.0f, 0.0f}, 0.0f),
+        r3d_quat_from_axis_angle((r3d_vec3_t){1.0f, 0.0f, 0.0f}, -0.4f));
     a->dist0 = r * 1.6f + 0.5f;
     a->dist = a->dist0;
     a->autospin = 1;
@@ -518,8 +526,33 @@ void r3d_engine_set_orbit(r3d_engine_handle handle,
 {
     if (!handle) return;
     r3d_anim_instance_t *a = (r3d_anim_instance_t *)handle;
-    a->yaw = yaw;
-    a->pitch = pitch;
+    a->orient = r3d_quat_normalize(r3d_quat_mul(
+        r3d_quat_from_axis_angle((r3d_vec3_t){0.0f, 1.0f, 0.0f}, yaw),
+        r3d_quat_from_axis_angle((r3d_vec3_t){1.0f, 0.0f, 0.0f}, -pitch)));
+    if (dist_scale > 0.0f) a->dist = a->dist0 * dist_scale;
+}
+
+/* 增量旋转(轨迹球)。d_yaw 绕相机当前的局部 up 轴、d_pitch 绕局部 right 轴，
+ * 均为后乘 —— 局部轴随姿态一起转，所以任何姿态下拖拽灵敏度都一致，
+ * 也能连续越过极点，不需要夹角。交互式拖拽应优先用本接口而非 set_orbit
+ * (后者经欧拉角，仍受其表达能力限制)。 */
+void r3d_engine_orbit_delta(r3d_engine_handle handle,
+                            float d_yaw, float d_pitch, float dist_scale)
+{
+    if (!handle) return;
+    r3d_anim_instance_t *a = (r3d_anim_instance_t *)handle;
+    if (d_yaw != 0.0f)
+        a->orient = r3d_quat_mul(a->orient,
+            r3d_quat_from_axis_angle((r3d_vec3_t){0.0f, 1.0f, 0.0f}, d_yaw));
+    /* 注意 X 轴取负：后乘 Rx(θ) 会把偏移 (0,0,d) 变成 (0,-d*sinθ,d*cosθ)，
+     * 即 θ>0 让相机向屏幕下方走、模型看着向上跑，与手指反向。取负后与
+     * set_orbit 的 Rx(-pitch) 一致，也与旧球坐标 eye.y=d*sin(pitch) 同向。
+     * (tests/test_drag_direction.c 端到端投影验证方向) */
+    if (d_pitch != 0.0f)
+        a->orient = r3d_quat_mul(a->orient,
+            r3d_quat_from_axis_angle((r3d_vec3_t){1.0f, 0.0f, 0.0f}, -d_pitch));
+    /* 增量长期累积会让模长漂移，每次归一化(成本可忽略) */
+    a->orient = r3d_quat_normalize(a->orient);
     if (dist_scale > 0.0f) a->dist = a->dist0 * dist_scale;
 }
 
@@ -563,13 +596,26 @@ int r3d_engine_render_frame(r3d_engine_handle handle, float elapsed)
     int back = ctx->double_buffer ? (ctx->cur_buf ^ 1) : 0;
 
     /* 自旋(无外部交互时缓慢旋转，与 demo_viewer 一致：约 0.4 rad/s) */
-    if (a->autospin) a->yaw += 0.4f * elapsed;
+    /* 自旋(约 0.4 rad/s)。这里必须"前乘"世界 Y：物体绕自身竖轴转，
+     * 与相机当前朝向无关。若后乘局部 Y，拖拽改变姿态后自旋轴会跟着歪掉。 */
+    if (a->autospin) {
+        a->orient = r3d_quat_normalize(r3d_quat_mul(
+            r3d_quat_from_axis_angle((r3d_vec3_t){0.0f, 1.0f, 0.0f},
+                                     0.4f * elapsed),
+            a->orient));
+    }
 
-    r3d_vec3_t eye = { a->center.x + a->dist * cosf(a->pitch) * sinf(a->yaw),
-                       a->center.y + a->dist * sinf(a->pitch),
-                       a->center.z + a->dist * cosf(a->pitch) * cosf(a->yaw) };
+    /* eye = center + q*(0,0,dist)，up = q*(0,1,0)。
+     * up 由姿态给出而非固定世界 Y，故视线与 up 永不平行，look_at 不会退化。 */
+    r3d_vec3_t off = r3d_quat_rotate_vec3(a->orient,
+                                          (r3d_vec3_t){0.0f, 0.0f, a->dist});
+    r3d_vec3_t eye = { a->center.x + off.x,
+                       a->center.y + off.y,
+                       a->center.z + off.z };
+    r3d_vec3_t up = r3d_quat_rotate_vec3(a->orient,
+                                         (r3d_vec3_t){0.0f, 1.0f, 0.0f});
     r3d_camera_t cam;
-    r3d_mat4_look_at(&cam.view, eye, a->center, (r3d_vec3_t){0, 1, 0});
+    r3d_mat4_look_at(&cam.view, eye, a->center, up);
     /* 近/远平面按相机距离+模型半径自适应：固定 0.05/100 对大模型(如 Fox，
      * 对角线可达 ~200)会让远端顶点超出远平面、近端跨近平面被整片丢弃 → 闪烁。
      * 远平面留足模型对角线余量，近平面取距离的小比例但不小于 0.05。 */

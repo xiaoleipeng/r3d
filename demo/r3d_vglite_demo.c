@@ -319,8 +319,10 @@ static int touch_poll(touch_ctx_t *tc, float *yaw, float *pitch, float *zoom,
                 int dy = y - tc->last_y;
                 *yaw   += (float)dx * DRAG_YAW_PER_PX;   /* 横向拖拽 → 绕 Y 转 */
                 *pitch += (float)dy * DRAG_PITCH_PER_PX; /* 纵向拖拽 → 俯仰 */
-                if (*pitch >  1.5f) *pitch =  1.5f;
-                if (*pitch < -1.5f) *pitch = -1.5f;
+                /* 不再夹 pitch：相机姿态已改为四元数，绕局部轴增量旋转没有
+                 * 万向锁，可连续越过极点。原先夹到 ±1.5 rad 是为了躲开球坐标
+                 * 在 ±90° 处的退化，代价是接近极点时横向拖拽几乎不动
+                 * (cos(1.5)=0.07，即只剩 7% 的灵敏度)。 */
                 /* 累计位移超过阈值则判定为拖拽，抬手不触发双击 */
                 if (abs(x - tc->down_x) > DOUBLE_TAP_MAX_MOVE ||
                     abs(y - tc->down_y) > DOUBLE_TAP_MAX_MOVE)
@@ -459,7 +461,7 @@ int main(int argc, FAR char *argv[])
         printf("[%s] playing [%d/%d]: %s\n", LOG_TAG,
                play_idx + 1, pl.count, model_path);
 
-        /* 触摸 orbit 状态(每个模型重置视角) */
+        /* 本帧拖拽增量(每帧清零，不是累积角度) */
         float yaw = 0.0f, pitch = 0.0f;
         float zoom = 1.0f;          /* 缩放倍数：<1 放大(拉近)，>1 缩小(拉远) */
         float model_elapsed = 0.0f;
@@ -475,6 +477,9 @@ int main(int argc, FAR char *argv[])
              * 单指双击(左半缩小/右半放大)改 zoom。
              * 交互期间暂停切换计时：用户正在看/操作当前模型时不累计 model_elapsed，
              * 松手后才继续累计，避免操作过程中被切走。 */
+            /* yaw/pitch 每帧清零 → touch_poll 累加出的是"本帧增量"，
+             * 直接喂给 orbit_delta 做四元数后乘，不保留任何欧拉角状态。 */
+            yaw = 0.0f; pitch = 0.0f;
             int zoom_tapped = 0;
             int interacting = touch_poll(&touch, &yaw, &pitch, &zoom, &zoom_tapped);
             if (interacting) {
@@ -486,7 +491,7 @@ int main(int argc, FAR char *argv[])
                 } else {
                     /* 拖拽/捏合：暂停自旋并按 orbit 设置相机 */
                     r3d_engine_set_autospin(handle, 0);
-                    r3d_engine_set_orbit(handle, yaw, pitch, zoom);
+                    r3d_engine_orbit_delta(handle, yaw, pitch, zoom);
                 }
             } else {
                 /* 无触摸：累计切换计时；只叠加缩放(不改 yaw/pitch，避免打断自旋)；

@@ -67,6 +67,12 @@ int r3d_engine_render_frame(r3d_engine_handle handle, float elapsed);
 int  r3d_engine_set_autospin(r3d_engine_handle handle, int enable);
 void r3d_engine_set_orbit(r3d_engine_handle handle,
                           float yaw, float pitch, float dist_scale);
+
+/* 增量旋转(轨迹球)。d_yaw/d_pitch 为本次的角度增量(弧度)，分别绕相机当前的
+ * 局部 up / right 轴。内部只做四元数后乘，无万向锁、无需夹 pitch，可连续越过
+ * 极点。交互式拖拽应优先用本接口。 */
+void r3d_engine_orbit_delta(r3d_engine_handle handle,
+                            float d_yaw, float d_pitch, float dist_scale);
 /* 仅设置缩放(相对默认距离的倍数，<1 放大、>1 缩小)，不改变 yaw/pitch，
  * 因此可在自旋进行时叠加缩放而不打断旋转。 */
 void r3d_engine_set_zoom(r3d_engine_handle handle, float dist_scale);

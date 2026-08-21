@@ -112,6 +112,58 @@ void r3d_mat4_from_trs(r3d_mat4_t *out, r3d_vec3_t t, r3d_quat_t r, r3d_vec3_t s
     *out = rot;
 }
 
+r3d_quat_t r3d_quat_identity(void)
+{
+    r3d_quat_t q = { 0.0f, 0.0f, 0.0f, 1.0f };
+    return q;
+}
+
+/* 轴角 → 四元数。axis 不需预先归一化。 */
+r3d_quat_t r3d_quat_from_axis_angle(r3d_vec3_t axis, float angle)
+{
+    float len = sqrtf(axis.x*axis.x + axis.y*axis.y + axis.z*axis.z);
+    if (len < 1e-8f) return r3d_quat_identity();
+    float s = sinf(angle * 0.5f) / len;
+    r3d_quat_t q = { axis.x * s, axis.y * s, axis.z * s, cosf(angle * 0.5f) };
+    return q;
+}
+
+/* 哈密顿积。r = a*b 表示"先施加 b 再施加 a"(与矩阵乘法同序)。
+ * 相机做增量旋转时：后乘 = 绕自身局部轴转，前乘 = 绕世界轴转。 */
+r3d_quat_t r3d_quat_mul(r3d_quat_t a, r3d_quat_t b)
+{
+    r3d_quat_t r;
+    r.w = a.w*b.w - a.x*b.x - a.y*b.y - a.z*b.z;
+    r.x = a.w*b.x + a.x*b.w + a.y*b.z - a.z*b.y;
+    r.y = a.w*b.y - a.x*b.z + a.y*b.w + a.z*b.x;
+    r.z = a.w*b.z + a.x*b.y - a.y*b.x + a.z*b.w;
+    return r;
+}
+
+/* 归一化。增量旋转会长期累积，必须周期性归一化以免漂移。 */
+r3d_quat_t r3d_quat_normalize(r3d_quat_t q)
+{
+    float n = sqrtf(q.x*q.x + q.y*q.y + q.z*q.z + q.w*q.w);
+    if (n < 1e-8f) return r3d_quat_identity();
+    float inv = 1.0f / n;
+    r3d_quat_t r = { q.x*inv, q.y*inv, q.z*inv, q.w*inv };
+    return r;
+}
+
+/* v' = q * v * q^-1，展开为不含三角函数的形式 */
+r3d_vec3_t r3d_quat_rotate_vec3(r3d_quat_t q, r3d_vec3_t v)
+{
+    /* t = 2 * (q_vec × v) ; v' = v + q_w * t + q_vec × t */
+    float tx = 2.0f * (q.y*v.z - q.z*v.y);
+    float ty = 2.0f * (q.z*v.x - q.x*v.z);
+    float tz = 2.0f * (q.x*v.y - q.y*v.x);
+    r3d_vec3_t r;
+    r.x = v.x + q.w*tx + (q.y*tz - q.z*ty);
+    r.y = v.y + q.w*ty + (q.z*tx - q.x*tz);
+    r.z = v.z + q.w*tz + (q.x*ty - q.y*tx);
+    return r;
+}
+
 r3d_quat_t r3d_quat_slerp(r3d_quat_t a, r3d_quat_t b, float t)
 {
     float cosom = a.x*b.x + a.y*b.y + a.z*b.z + a.w*b.w;

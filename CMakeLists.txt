@@ -65,6 +65,15 @@ add_executable(test_m2 tests/test_m2.c)
 target_link_libraries(test_m2 PRIVATE r3d)
 add_test(NAME test_m2 COMMAND test_m2 ${CMAKE_SOURCE_DIR}/tests/assets/tri_1.b3dm)
 
+# 四元数轨道相机：只依赖 r3d_math，后端无关
+add_executable(test_quat_orbit tests/test_quat_orbit.c)
+target_link_libraries(test_quat_orbit PRIVATE r3d m)
+add_test(NAME test_quat_orbit COMMAND test_quat_orbit)
+
+add_executable(test_drag_direction tests/test_drag_direction.c)
+target_link_libraries(test_drag_direction PRIVATE r3d m)
+add_test(NAME test_drag_direction COMMAND test_drag_direction)
+
 # ---- demo（仅 OpenGL 后端）----
 if(R3D_BACKEND_OPENGL)
     add_executable(demo_viewer tools/demo/demo_viewer.c)
