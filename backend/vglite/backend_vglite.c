@@ -486,7 +486,14 @@ static r3d_texture_handle_t vgl_create_texture(r3d_backend_t *self, const r3d_im
     t->buf.height           = (vg_lite_int32_t)img->h;
     t->buf.format           = VG_LITE_BGRA8888;   /* 纹理像素在 b3dm 中按 BGRA 字节序存储(见 gltf2b3dm)，与 framebuffer 同序，避免 R/B 反 */
     t->buf.tiled            = VG_LITE_LINEAR;
-    t->buf.image_mode       = VG_LITE_NORMAL_IMAGE_MODE;
+    /* MULTIPLY：让 pattern 像素与 paint color 相乘，从而把 CPU 逐三角形算出的
+     * 光照 tint(vgl_draw 里的 T->color)真正作用到纹理上。
+     * 不能靠 vg_lite_draw_pattern 的 color 参数——那个参数仅在
+     * pattern_mode == VG_LITE_PATTERN_COLOR 时用于填充 pattern 边界之外的像素
+     * (见 vg_lite.h 的 vg_lite_pattern_mode 注释)，而这里用的是 PATTERN_PAD，
+     * 故在 NORMAL_IMAGE_MODE 下 tint 会被硬件完全忽略，带纹理的模型看不出昼夜明暗。
+     * (softsim 无条件调制，比硬件宽松，曾掩盖此问题。) */
+    t->buf.image_mode       = VG_LITE_MULTIPLY_IMAGE_MODE;
     t->buf.transparency_mode= VG_LITE_IMAGE_OPAQUE;
     t->buf.stride           = ((vg_lite_int32_t)img->w * 4 + 63) & ~63;  /* 64 对齐 */
     t->buf.handle           = NULL;
