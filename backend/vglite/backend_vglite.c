@@ -245,6 +245,12 @@ typedef struct {
     /* 纹理表(句柄=指针) */
     /* 直接用 vgl_tex_t* 作句柄，无需表 */
 
+    /* 上层注入的渲染钩子与清屏色。引擎本身不提供文字/背景/后处理能力，
+     * 由上层通过钩子自行绘制(见 demo 的表盘示例)。 */
+    r3d_render_hook_t hook;
+    void             *hook_user;
+    uint32_t          clear_argb;
+
     /* ---- 每帧计数(end_frame 末尾汇总进秒窗口) ---- */
     uint32_t draw_calls;       /* 本帧 vg_lite_draw / draw_pattern 调用次数 */
     uint32_t tex_binds;        /* 本帧纹理绑定次数(draw_pattern) */
@@ -405,6 +411,7 @@ static r3d_result_t vgl_init(r3d_backend_t *self, const r3d_backend_cfg_t *cfg)
     im->vcache_gen = 0;
 
     r3d_light_params_default(&im->light);   /* 光照默认参数(中性外观) */
+    im->clear_argb = 0xFF1F1F26u;          /* 与原行为一致；上层可改 */
 
     /* 每三角形一个 vg_lite_path_t + 一段 11 float 的 path 数据(存活到帧末 finish) */
     im->vgpaths_cap = cap;
@@ -577,11 +584,29 @@ static void vgl_begin_frame(r3d_backend_t *self, const r3d_target_t *target)
 
     /* 清屏(深色背景)。clear 命令与后续 draw 同批，帧末 end_frame 统一 finish。 */
     if (im->target_valid) {
-        vg_lite_color_t bg = argb_to_vgl(0xFF1F1F26u);
+        vg_lite_color_t bg = argb_to_vgl(im->clear_argb);
         vg_lite_error_t e = vg_lite_clear(&im->target, NULL, bg);
         if (e != VG_LITE_SUCCESS)
             VGL_ERR("vg_lite_clear ret=%d(%s)", (int)e, vgl_err_str(e));
+        /* 背景层：紧跟清屏，随后的几何会覆盖它，故天然有遮挡关系 */
+        if (im->hook)
+            im->hook(R3D_RENDER_PRE_GEOMETRY, &im->target,
+                     im->vp_w, im->vp_h, im->hook_user);
     }
+}
+
+static void vgl_set_render_hook(r3d_backend_t *self, r3d_render_hook_t fn,
+                                void *user)
+{
+    vgl_impl_t *im = (vgl_impl_t *)self->impl;
+    im->hook = fn;
+    im->hook_user = user;
+}
+
+static void vgl_set_clear_color(r3d_backend_t *self, uint32_t argb)
+{
+    vgl_impl_t *im = (vgl_impl_t *)self->impl;
+    im->clear_argb = argb;
 }
 
 static void vgl_set_camera(r3d_backend_t *self, const r3d_camera_t *cam)
@@ -1323,6 +1348,13 @@ static void vgl_end_frame(r3d_backend_t *self)
     if (fe != VG_LITE_SUCCESS)
         VGL_ERR("end_frame vg_lite_finish ret=%d(%s)", (int)fe, vgl_err_str(fe));
 
+    /* 覆盖层：必须在上面的 finish 之后 —— 几何是在 finish 处才真正落地的，
+     * 早于它绘制会被随后落地的不透明几何盖掉。钩子内若自行提交命令，需自己
+     * finish(或依赖下面 present 的 finish)。 */
+    if (im->hook)
+        im->hook(R3D_RENDER_POST_GEOMETRY, &im->target,
+                 im->vp_w, im->vp_h, im->hook_user);
+
     /* path 数据写在常驻 im->path_data，下一帧直接覆写复用，destroy 时统一释放。 */
     long frame_us = vgl_now_us() - im->frame_begin_us;
     vgl_stats_tick(im, submit_tris, im->draw_calls, im->tex_binds,
@@ -1366,6 +1398,8 @@ static const r3d_backend_vtable_t VGL_VT = {
     .create_texture  = vgl_create_texture,
     .destroy_texture = vgl_destroy_texture,
     .begin_frame     = vgl_begin_frame,
+    .set_render_hook = vgl_set_render_hook,
+    .set_clear_color = vgl_set_clear_color,
     .set_camera      = vgl_set_camera,
     .set_lighting    = vgl_set_lighting,
     .draw            = vgl_draw,

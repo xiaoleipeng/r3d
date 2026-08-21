@@ -106,6 +106,16 @@ typedef struct {
      * 本帧的还未知，故按 1 帧延迟随下一帧的 perf_frame_mark 上报。 */
     long                prev_pan_us;
 
+    /* 画面垂直偏移(像素，+ 向下)。用投影矩阵的垂直镜头偏移实现：给 proj 的
+     * y 行/z 列加常数等价于 ndc.y 减常数，是纯屏幕空间平移，物体轮廓仍是同
+     * 半径的圆，只是圆心跟着移。圆屏表盘想在上方腾出空间时用。
+     * 这一项必须在引擎里 —— 投影矩阵由引擎构造，外部拿不到。 */
+    float               view_dy;
+
+    /* 上一帧算出的物体屏幕半径(像素)。供上层按实际尺寸排布覆盖层，
+     * 避免把布局写死成像素常量。首帧为 0，上层需兜底。 */
+    float               last_r_screen;
+
     /* 渲染后端 */
     r3d_backend_t      *be;
 } r3d_engine_ctx_t;
@@ -624,12 +634,33 @@ int r3d_engine_render_frame(r3d_engine_handle handle, float elapsed)
     if (near_plane < 0.05f) near_plane = 0.05f;
     r3d_mat4_perspective(&cam.proj, 1.0f,
                          (float)ctx->fb_w / (float)ctx->fb_h, near_plane, far_plane);
+    /* 垂直镜头偏移：m[9] 是列主序下的 (y 行, z 列)。clip.y = m[5]*vy + m[9]*vz，
+     * clip.w = -vz，故 ndc.y = m[5]*vy/(-vz) - m[9]，即整幅画面平移。
+     * 屏幕 y = (1-(ndc*0.5+0.5))*h，故 Δy_screen = 0.5*h*m[9] → m[9] = 2*dy/h。 */
+    if (ctx->view_dy != 0.0f)
+        cam.proj.m[9] = 2.0f * ctx->view_dy / (float)ctx->fb_h;
     cam.viewport = (r3d_viewport_t){ 0, 0, ctx->fb_w, ctx->fb_h };
 
     if (trace) R3D_TRACE("  [2] begin_frame back=%d", back);
     ctx->be->vt->begin_frame(ctx->be, &ctx->rt[back]);
     if (trace) R3D_TRACE("  [3] set_camera");
     ctx->be->vt->set_camera(ctx->be, &cam);
+
+    /* 记录物体轮廓的屏幕半径，供上层(覆盖层排版等)查询。
+     * 相机恒定看向 a->center，故圆心就是视口中心 + view_dy。
+     * a->radius 存的是最大轴向 extent(直径)，取半才是包围球半径。
+     * 轮廓的屏幕半径由切线张角决定：
+     *   theta = asin(R/d)，r = (vp_h/2) * tan(theta) / tan(fovy/2)
+     * 不能简单用 R/d 线性外推 —— 透视下切点不在球心平面上。 */
+    {
+        float sphere_r = a->radius * 0.5f;
+        ctx->last_r_screen = 0.0f;
+        if (a->dist > sphere_r) {
+            float theta = asinf(sphere_r / a->dist);
+            ctx->last_r_screen = ((float)ctx->fb_h * 0.5f)
+                               * tanf(theta) / tanf(0.5f);
+        }
+    }
 
     /* model 矩阵：动画驱动 root，否则单位 */
     r3d_mat4_t model;
@@ -806,6 +837,38 @@ int r3d_engine_set_lighting(const r3d_light_params_t *lp)
     if (g_ctx == NULL || g_ctx->be == NULL) return R3D_ENGINE_ERR_INIT;
     if (g_ctx->be->vt->set_lighting == NULL) return R3D_ENGINE_ERR_PARAM; /* 后端不支持 */
     g_ctx->be->vt->set_lighting(g_ctx->be, lp);
+    return R3D_ENGINE_OK;
+}
+
+/* 画面垂直偏移(像素，+ 向下)。用投影的垂直镜头偏移实现，是纯屏幕平移，
+ * 物体轮廓半径不变。 */
+int r3d_engine_set_view_shift(float dy_px)
+{
+    if (g_ctx == NULL) return R3D_ENGINE_ERR_INIT;
+    g_ctx->view_dy = dy_px;
+    return R3D_ENGINE_OK;
+}
+
+/* 上一帧的物体屏幕半径(像素)，0 = 尚未渲染过。 */
+float r3d_engine_get_screen_radius(void)
+{
+    if (g_ctx == NULL) return 0.0f;
+    return g_ctx->last_r_screen;
+}
+
+int r3d_engine_set_render_hook(r3d_render_hook_t fn, void *user)
+{
+    if (g_ctx == NULL || g_ctx->be == NULL) return R3D_ENGINE_ERR_INIT;
+    if (g_ctx->be->vt->set_render_hook == NULL) return R3D_ENGINE_ERR_PARAM;
+    g_ctx->be->vt->set_render_hook(g_ctx->be, fn, user);
+    return R3D_ENGINE_OK;
+}
+
+int r3d_engine_set_clear_color(uint32_t argb)
+{
+    if (g_ctx == NULL || g_ctx->be == NULL) return R3D_ENGINE_ERR_INIT;
+    if (g_ctx->be->vt->set_clear_color == NULL) return R3D_ENGINE_ERR_PARAM;
+    g_ctx->be->vt->set_clear_color(g_ctx->be, argb);
     return R3D_ENGINE_OK;
 }
 

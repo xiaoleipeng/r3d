@@ -45,6 +45,19 @@ typedef struct {
 typedef struct r3d_backend r3d_backend_t;
 
 /* ---- 后端 vtable（9 方法）---- */
+/* 渲染钩子：让上层在引擎的绘制流程中插入自己的 2D 绘制(背景、HUD、覆盖层)，
+ * 而不必把这些能力做进引擎本身。target 是后端当前的绘制目标(VGLite 后端下是
+ * vg_lite_buffer_t*)，上层按自己使用的后端强转。
+ *   PRE_GEOMETRY  : 清屏之后、几何绘制之前 —— 画背景(会被几何遮挡)
+ *   POST_GEOMETRY : 几何提交完成之后、上屏之前 —— 画覆盖层(盖在几何之上) */
+typedef enum {
+    R3D_RENDER_PRE_GEOMETRY = 0,
+    R3D_RENDER_POST_GEOMETRY,
+} r3d_render_stage_t;
+
+typedef void (*r3d_render_hook_t)(r3d_render_stage_t stage, void *target,
+                                  int width, int height, void *user);
+
 typedef struct r3d_backend_vtable {
     /* 生命周期 */
     r3d_result_t (*init)(r3d_backend_t *self, const r3d_backend_cfg_t *cfg);
@@ -60,6 +73,12 @@ typedef struct r3d_backend_vtable {
 
     /* 光照参数（运行时可调，NULL=恢复默认）。可选，不支持的后端置 NULL。 */
     void (*set_lighting)(r3d_backend_t *self, const r3d_light_params_t *lp);
+
+    /* 渲染钩子(见上方 r3d_render_hook_t)。fn=NULL 取消。 */
+    void (*set_render_hook)(r3d_backend_t *self, r3d_render_hook_t fn, void *user);
+
+    /* 清屏颜色(ARGB8888)。默认深灰蓝，太空类场景可设为纯黑。 */
+    void (*set_clear_color)(r3d_backend_t *self, uint32_t argb);
 
     /* 绘制一个可渲染对象（draw call）——核心调用 */
     void (*draw)(r3d_backend_t *self,
