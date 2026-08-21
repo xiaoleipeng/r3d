@@ -116,15 +116,22 @@ vg_lite_error_t vg_lite_upload_path(vg_lite_path_t *path)
 /* ---- 软件光栅化辅助 ---- */
 
 /* 从 FP32 path 数据提取三角形 3 顶点(MOVE,LINE,LINE,CLOSE,END) */
+/* VG_LITE_FP32 path layout: each word is 4 bytes; opcode words hold a raw
+ * uint32 (NOT a float-encoded value), coordinate words hold float. This
+ * matches how backend_vglite.c emits paths, and how LVGL's production
+ * vg_lite backend does it (lv_vg_lite_path_append_op: FP32/S32 -> uint32
+ * opcode, points -> float). Reading the opcode as float yields a denormal
+ * that casts to 0, which silently drops every triangle. */
 static int extract_tri(const vg_lite_path_t *path, float vx[3], float vy[3])
 {
-    const float *p = (const float *)path->path;
-    int n = 0, i = 0, words = (int)(path->path_length / sizeof(float));
+    const uint32_t *pop = (const uint32_t *)path->path;
+    const float *pdata = (const float *)path->path;
+    int n = 0, i = 0, words = (int)(path->path_length / sizeof(uint32_t));
     while (i < words && n < 3) {
-        int op = (int)p[i];
+        uint32_t op = pop[i];
         if (op == VLC_OP_MOVE || op == VLC_OP_LINE) {
             if (i + 2 >= words) break;
-            vx[n] = p[i+1]; vy[n] = p[i+2]; n++; i += 3;
+            vx[n] = pdata[i+1]; vy[n] = pdata[i+2]; n++; i += 3;
         } else if (op == VLC_OP_CLOSE) { i += 1; }
         else if (op == VLC_OP_END) break;
         else i += 1;
