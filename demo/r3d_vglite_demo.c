@@ -97,6 +97,20 @@
 static volatile bool g_running = true;
 static volatile bool g_screenshot_req = false;
 
+/* 能力验证：回调在 render_frame 返回前执行，demo 用一次日志确认它已触发。
+ * 星球表盘的实际覆盖层绘制在后续 example 提交中接入。 */
+static int g_post_geometry_calls;
+
+static void demo_post_geometry(void *target, int width, int height, void *user)
+{
+    (void)target;
+    (void)user;
+    g_post_geometry_calls++;
+    if (g_post_geometry_calls == 1)
+        printf("[%s] post-geometry hook: target=%dx%d\n", LOG_TAG,
+               width, height);
+}
+
 static void signal_handler(int signo)
 {
     if (signo == SIGINT || signo == SIGTERM) {
@@ -431,6 +445,11 @@ int main(int argc, FAR char *argv[])
         fprintf(stderr, "[%s] r3d_engine_init failed: %d\n", LOG_TAG, ret);
         return EXIT_FAILURE;
     }
+
+    int hook_ret = r3d_engine_set_post_geometry_hook(demo_post_geometry, NULL);
+    if (hook_ret != R3D_ENGINE_OK)
+        fprintf(stderr, "[%s] post-geometry hook unavailable: %d\n",
+                LOG_TAG, hook_ret);
 
     touch_ctx_t touch;
     touch_open(&touch, input_dev);   /* 失败不致命：仅禁用输入 */

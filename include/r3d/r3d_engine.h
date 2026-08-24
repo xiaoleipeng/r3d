@@ -86,6 +86,11 @@ int r3d_engine_set_lighting(const r3d_light_params_t *lp);
 /* 取当前光照参数(便于在默认基础上微调)。返回 0 成功。 */
 int r3d_engine_get_lighting(r3d_light_params_t *out);
 
+/* 注册后绘制钩子：3D 几何完成后、帧缓冲上屏前调用。
+ * target 是后端绘制目标；VGLite 后端下为 vg_lite_buffer_t *。
+ * fn=NULL 取消注册。后端不支持时返回 R3D_ENGINE_ERR_PARAM。 */
+int r3d_engine_set_post_geometry_hook(r3d_post_geometry_hook_t fn, void *user);
+
 #ifdef __cplusplus
 }
 #endif

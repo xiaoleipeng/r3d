@@ -61,6 +61,10 @@ typedef struct r3d_backend_vtable {
     /* 光照参数（运行时可调，NULL=恢复默认）。可选，不支持的后端置 NULL。 */
     void (*set_lighting)(r3d_backend_t *self, const r3d_light_params_t *lp);
 
+    /* 后绘制钩子(见上方 r3d_post_geometry_hook_t)。fn=NULL 取消。 */
+    void (*set_post_geometry_hook)(r3d_backend_t *self,
+                                   r3d_post_geometry_hook_t fn, void *user);
+
     /* 绘制一个可渲染对象（draw call）——核心调用 */
     void (*draw)(r3d_backend_t *self,
                  const r3d_mesh_t     *mesh,

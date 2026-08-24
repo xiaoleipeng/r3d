@@ -12,6 +12,10 @@
 extern "C" {
 #endif
 
+/* 后绘制钩子：在 3D 几何完成、帧缓冲上屏前插入覆盖层绘制。 */
+typedef void (*r3d_post_geometry_hook_t)(void *target, int width, int height,
+                                         void *user);
+
 /* ---- 结果码 ---- */
 typedef enum {
     R3D_OK = 0,
