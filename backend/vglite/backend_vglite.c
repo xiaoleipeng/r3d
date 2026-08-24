@@ -245,6 +245,10 @@ typedef struct {
     /* 纹理表(句柄=指针) */
     /* 直接用 vgl_tex_t* 作句柄，无需表 */
 
+    /* 上层覆盖层钩子。引擎本身不提供 2D 绘制能力。 */
+    r3d_post_geometry_hook_t post_hook;
+    void                    *post_hook_user;
+
     /* ---- 每帧计数(end_frame 末尾汇总进秒窗口) ---- */
     uint32_t draw_calls;       /* 本帧 vg_lite_draw / draw_pattern 调用次数 */
     uint32_t tex_binds;        /* 本帧纹理绑定次数(draw_pattern) */
@@ -575,9 +579,9 @@ static void vgl_begin_frame(r3d_backend_t *self, const r3d_target_t *target)
     im->vp_w = (int)target->w;
     im->vp_h = (int)target->h;
 
-    /* 清屏(深色背景)。clear 命令与后续 draw 同批，帧末 end_frame 统一 finish。 */
+    /* 清屏(纯黑背景)。clear 命令与后续 draw 同批，帧末 end_frame 统一 finish。 */
     if (im->target_valid) {
-        vg_lite_color_t bg = argb_to_vgl(0xFF1F1F26u);
+        vg_lite_color_t bg = argb_to_vgl(0xFF000000u);
         vg_lite_error_t e = vg_lite_clear(&im->target, NULL, bg);
         if (e != VG_LITE_SUCCESS)
             VGL_ERR("vg_lite_clear ret=%d(%s)", (int)e, vgl_err_str(e));
@@ -597,6 +601,15 @@ static void vgl_set_lighting(r3d_backend_t *self, const r3d_light_params_t *lp)
     vgl_impl_t *im = (vgl_impl_t *)self->impl;
     if (lp) im->light = *lp;            /* 应用调用方参数 */
     else    r3d_light_params_default(&im->light); /* NULL = 恢复默认 */
+}
+
+static void vgl_set_post_geometry_hook(r3d_backend_t *self,
+                                        r3d_post_geometry_hook_t fn,
+                                        void *user)
+{
+    vgl_impl_t *im = (vgl_impl_t *)self->impl;
+    im->post_hook = fn;
+    im->post_hook_user = user;
 }
 
 /* ---------------- 绘制(收集三角形) ---------------- */
@@ -1195,6 +1208,15 @@ static void vgl_end_frame(r3d_backend_t *self)
             if (fe != VG_LITE_SUCCESS)
                 VGL_ERR("end_frame(empty) vg_lite_finish ret=%d(%s)",
                         (int)fe, vgl_err_str(fe));
+
+            if (im->post_hook) {
+                im->post_hook(&im->target, im->vp_w, im->vp_h,
+                              im->post_hook_user);
+                fe = vg_lite_finish();
+                if (fe != VG_LITE_SUCCESS)
+                    VGL_ERR("post-geometry finish ret=%d(%s)",
+                            (int)fe, vgl_err_str(fe));
+            }
         }
         vgl_stats_tick(im, 0, 0, 0,
                        im->collect_us_accum, 0, 0, gpu_us,
@@ -1323,6 +1345,18 @@ static void vgl_end_frame(r3d_backend_t *self)
     if (fe != VG_LITE_SUCCESS)
         VGL_ERR("end_frame vg_lite_finish ret=%d(%s)", (int)fe, vgl_err_str(fe));
 
+    /* 几何已完成，覆盖层现在绘制到同一目标；由回调方提交自己的命令。 */
+    if (im->post_hook)
+        im->post_hook(&im->target, im->vp_w, im->vp_h, im->post_hook_user);
+
+    /* 覆盖层命令也必须完成后才能翻页上屏。 */
+    if (im->post_hook) {
+        fe = vg_lite_finish();
+        if (fe != VG_LITE_SUCCESS)
+            VGL_ERR("post-geometry finish ret=%d(%s)",
+                    (int)fe, vgl_err_str(fe));
+    }
+
     /* path 数据写在常驻 im->path_data，下一帧直接覆写复用，destroy 时统一释放。 */
     long frame_us = vgl_now_us() - im->frame_begin_us;
     vgl_stats_tick(im, submit_tris, im->draw_calls, im->tex_binds,
@@ -1368,6 +1402,7 @@ static const r3d_backend_vtable_t VGL_VT = {
     .begin_frame     = vgl_begin_frame,
     .set_camera      = vgl_set_camera,
     .set_lighting    = vgl_set_lighting,
+    .set_post_geometry_hook = vgl_set_post_geometry_hook,
     .draw            = vgl_draw,
     .end_frame       = vgl_end_frame,
     .present         = vgl_present,

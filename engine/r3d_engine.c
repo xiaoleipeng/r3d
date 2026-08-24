@@ -816,3 +816,12 @@ int r3d_engine_get_lighting(r3d_light_params_t *out)
     r3d_light_params_default(out);
     return R3D_ENGINE_OK;
 }
+
+int r3d_engine_set_post_geometry_hook(r3d_post_geometry_hook_t fn, void *user)
+{
+    if (g_ctx == NULL || g_ctx->be == NULL) return R3D_ENGINE_ERR_INIT;
+    if (g_ctx->be->vt->set_post_geometry_hook == NULL)
+        return R3D_ENGINE_ERR_PARAM;
+    g_ctx->be->vt->set_post_geometry_hook(g_ctx->be, fn, user);
+    return R3D_ENGINE_OK;
+}
