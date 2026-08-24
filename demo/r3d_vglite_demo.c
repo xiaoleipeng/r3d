@@ -34,6 +34,9 @@
  * Usage:
  *   r3d_vglite_demo <model.b3dm | dir> [options]
  *
+ * Example watch-face models ship under examples/watchface/assets/
+ * (earth.b3dm, earth_lo.b3dm); push one to the device and pass its path.
+ *
  * Options:
  *   -d <device>   Framebuffer device (default: CONFIG_R3D_FOR_VGLITE_FB_DEV)
  *   -i <device>   Touch input device (default: /dev/input0)
@@ -66,6 +69,7 @@
 #include <nuttx/video/fb.h>
 
 #include "r3d/r3d_engine.h"
+#include "../examples/watchface/wf_decor.h"
 
 #ifndef CONFIG_R3D_VGLITE_DEMO_DEFAULT_FPS
 #define CONFIG_R3D_VGLITE_DEMO_DEFAULT_FPS 60
@@ -94,22 +98,11 @@
 #define DOUBLE_TAP_ZOOM_IN    0.7f   /* 右半：放大(距离*0.7，拉近) */
 #define DOUBLE_TAP_ZOOM_OUT   1.4f   /* 左半：缩小(距离*1.4，拉远) */
 
+/* 表盘装饰层状态。装饰能力不在引擎里，由 example 通过后绘制钩子提供。 */
+static wf_decor_t g_wf;
+
 static volatile bool g_running = true;
 static volatile bool g_screenshot_req = false;
-
-/* 能力验证：回调在 render_frame 返回前执行，demo 用一次日志确认它已触发。
- * 星球表盘的实际覆盖层绘制在后续 example 提交中接入。 */
-static int g_post_geometry_calls;
-
-static void demo_post_geometry(void *target, int width, int height, void *user)
-{
-    (void)target;
-    (void)user;
-    g_post_geometry_calls++;
-    if (g_post_geometry_calls == 1)
-        printf("[%s] post-geometry hook: target=%dx%d\n", LOG_TAG,
-               width, height);
-}
 
 static void signal_handler(int signo)
 {
@@ -132,6 +125,32 @@ static void print_usage(const char *progname)
     printf("  -t <seconds>  Seconds per model in folder mode (default: %.0f)\n",
            DEFAULT_SECS_PER_MODEL);
     printf("  -s <0|1>      Auto-spin camera (default: 1)\n");
+    printf("  -L <0|1>      Space day/night lighting (default: 1; 0 = engine default)\n");
+    printf("  -G <0|1>      Shade via screen-space mask instead of per-triangle\n"
+"  -T <0|1>      Watch-face text overlay: time / seconds / date (default 1)\n"
+"  -Z <scale>    Initial zoom, dist multiplier (default 0.90; <1 = larger)\n"
+"  -Y <px>       Shift the scene down by px, freeing room on top (default 12)\n"
+"  -J <px>       Time text height (default 0 = 7.1%% of screen height)\n"
+"  -P <RRGGBB>   Text and side-arc colour (default FFFFFF)\n"
+"  -Q <n>        Background star count, 0 = off (default 40)\n"
+"  -D <0|1>      Side decorative arcs beside the planet (default 1)\n"
+"  -W <0|1|2>    Font: 0 = 7-segment, 1 = 5x7 dot matrix, 2 = geometric\n"
+"                monoline, aerospace-instrument look (default 2)\n"
+"  -K <px>       Gap from halo edge to text inner edge (default 14; smaller =\n"
+"                closer to the planet but larger end-glyph rotation)\n"
+"  -B <n>        Limb darkening width as fraction of radius (default 0.06,\n"
+"                0 = off; suppresses the hard bright rim and hides\n"
+"                silhouette aliasing under grazing light)\n");
+    printf("                (default 0; removes the facet steps at the terminator)\n");
+    printf("  -A <x,y,z>    Light direction in view space (default 0.9,0.22,0.38)\n");
+    printf("                smaller z = larger angle to view axis = more shadow\n");
+    printf("  -M <n>        Ambient (default 0.04; raise to lift the dark side)\n");
+    printf("  -N <n>        Diffuse (default 1.15)\n");
+    printf("  -H <strength> Halo ring peak brightness (0 = off, try 1.2)\n");
+    printf("  -C <RRGGBB>   Halo colour hex (default 5B7099, tuned to Blue Marble)\n");
+    printf("  -E <n>        Halo outer edge / planet radius (default 1.12)\n");
+    printf("  -I <n>        Halo inward bleed as fraction of radius, 0-1 (default 0.08)\n");
+    printf("  -F <n>        Halo outward falloff exponent (default 1.5)\n");
     printf("  -S <path>     Screenshot output path (default: /data/r3d_shot.ppm)\n");
     printf("  -h            Show this help\n\n");
     printf("Examples:\n");
@@ -238,6 +257,19 @@ static int fb_query_width(const char *fb_dev)
     return w;
 }
 
+/* 同上，取屏高用于文字覆盖层的上下布局。失败返回 0。 */
+static int fb_query_height(const char *fb_dev)
+{
+    int fd = open(fb_dev, O_RDONLY);
+    if (fd < 0) return 0;
+    struct fb_videoinfo_s vinfo;
+    int h = 0;
+    if (ioctl(fd, FBIOGET_VIDEOINFO, (unsigned long)&vinfo) == 0)
+        h = (int)vinfo.yres;
+    close(fd);
+    return h;
+}
+
 static int touch_open(touch_ctx_t *tc, const char *dev)
 {
     memset(tc, 0, sizeof(*tc));
@@ -331,12 +363,14 @@ static int touch_poll(touch_ctx_t *tc, float *yaw, float *pitch, float *zoom,
             if (tc->pressed) {
                 int dx = x - tc->last_x;
                 int dy = y - tc->last_y;
-                *yaw   += (float)dx * DRAG_YAW_PER_PX;   /* 横向拖拽 → 绕 Y 转 */
+                /* 相机绕轨道公转：eye.x 随 +sin(yaw) 走，故 yaw 增大相机向右移，
+                 * 模型看起来向左转。要让表面跟随手指（抓取式手感），横向需取负；
+                 * 纵向的 pitch 增大使相机升高、正面下倾，已与手指同向，保持不变。 */
+                *yaw   -= (float)dx * DRAG_YAW_PER_PX;   /* 横向拖拽 → 绕 Y 转 */
                 *pitch += (float)dy * DRAG_PITCH_PER_PX; /* 纵向拖拽 → 俯仰 */
                 /* 不再夹 pitch：相机姿态已改为四元数，绕局部轴增量旋转没有
                  * 万向锁，可连续越过极点。原先夹到 ±1.5 rad 是为了躲开球坐标
-                 * 在 ±90° 处的退化，代价是接近极点时横向拖拽几乎不动
-                 * (cos(1.5)=0.07，即只剩 7% 的灵敏度)。 */
+                 * 在 ±90° 处的退化，代价是接近极点时横向拖拽几乎不动。 */
                 /* 累计位移超过阈值则判定为拖拽，抬手不触发双击 */
                 if (abs(x - tc->down_x) > DOUBLE_TAP_MAX_MOVE ||
                     abs(y - tc->down_y) > DOUBLE_TAP_MAX_MOVE)
@@ -386,6 +420,11 @@ int main(int argc, FAR char *argv[])
     int   autospin = 0;   /* 默认关闭相机自旋：只做面部 morph 动画、相机固定，
                            * 便于隔离评估合批可行性(色彩变化仅来自 morph，不含视角变化)。
                            * 需要自旋时用 -s 1 开启。 */
+    /* 装饰层(光晕/遮罩/星点/弧线/文字)的全部观感参数集中在 example 的
+     * wf_preset_space() 里，不做成命令行开关 —— 它们是调出来的定值，
+     * 暴露成参数只会让 demo 难用。想换风格就复制那个预设改一份。 */
+    const float ZOOM0   = 0.90f;   /* 初始缩放：星球半径约 0.29*屏高，
+                                    * 使弧形文字既能贴表圈又贴近星球 */
     int   ret;
 
     if (argc < 2) {
@@ -436,6 +475,12 @@ int main(int argc, FAR char *argv[])
            LOG_TAG, arg_path, pl.count, pl.count > 1 ? "s" : "",
            fb_dev, target_fps, secs_per_model, autospin);
 
+    /* NuttX flat build 下 builtin app 与内核共享地址空间，静态全局只在镜像加载
+     * (即开机)时初始化一次，exec 不会重置。所以上一次运行收到 SIGTERM 把
+     * g_running 置 false 后，后续每次启动都会直接跳过渲染循环退出，必须显式复位。 */
+    g_running = true;
+    g_screenshot_req = false;
+
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
     signal(SIGUSR2, signal_handler);
@@ -446,14 +491,37 @@ int main(int argc, FAR char *argv[])
         return EXIT_FAILURE;
     }
 
-    int hook_ret = r3d_engine_set_post_geometry_hook(demo_post_geometry, NULL);
-    if (hook_ret != R3D_ENGINE_OK)
-        fprintf(stderr, "[%s] post-geometry hook unavailable: %d\n",
-                LOG_TAG, hook_ret);
+    /* 太空昼夜光照。light_dir 在 view 空间：光跟随相机，晨昏线固定在屏幕上、
+     * 地表从明暗交界滚过，视觉上等价于"太阳不动 + 地球自转"。
+     * 着色是逐三角形 flat 的，但晨昏线本身是渐变，实测 960 三角形已无可见台阶。 */
+    /* ---- 装饰层：由 example 在 3D 几何完成后绘制 ---- */
+    wf_decor_init(&g_wf);
+    wf_preset_space(&g_wf);          /* 观感参数集中在这一个预设里 */
+    int overlay = (r3d_engine_set_post_geometry_hook(wf_decor_hook, &g_wf) == 0);
+    if (!overlay)
+        fprintf(stderr, "[%s] render hook unsupported by backend\n", LOG_TAG);
+
+    /* 明暗由遮罩逐像素提供，几何侧走均匀满亮度，避免逐图元 flat 着色的台阶。 */
+    {
+        r3d_light_params_t lp;
+        r3d_light_params_default(&lp);
+        lp.ambient = 1.0f;
+        lp.diffuse = 0.0f;
+        lp.hemi    = 0.0f;
+        lp.lit_max = 1.0f;
+        r3d_engine_set_lighting(&lp);
+    }
 
     touch_ctx_t touch;
     touch_open(&touch, input_dev);   /* 失败不致命：仅禁用输入 */
     touch.screen_w = fb_query_width(fb_dev);  /* 双击左右半屏判定用 */
+
+    /* 屏幕尺寸：布局按屏高取比例，换分辨率自动跟随(见 example 的 wf_frame) */
+    int scr_w = touch.screen_w > 0 ? touch.screen_w : 480;
+    int scr_h = fb_query_height(fb_dev);
+    if (scr_h <= 0) scr_h = scr_w;
+
+    float clock_acc = 0.0f;   /* 合成时钟累计秒，见 example 的 wf_clock_text */
 
     float frame_interval = 1.0f / (float)target_fps;
     float last_time = get_time_sec();
@@ -482,7 +550,7 @@ int main(int argc, FAR char *argv[])
 
         /* 本帧拖拽增量(每帧清零，不是累积角度) */
         float yaw = 0.0f, pitch = 0.0f;
-        float zoom = 1.0f;          /* 缩放倍数：<1 放大(拉近)，>1 缩小(拉远) */
+        float zoom = ZOOM0;         /* 缩放倍数：<1 放大(拉近)，>1 缩小(拉远) */
         float model_elapsed = 0.0f;
         float idle_since_touch = AUTOSPIN_RESUME_IDLE;  /* 初始即允许自旋 */
 
@@ -508,7 +576,7 @@ int main(int argc, FAR char *argv[])
                      * 不打断自旋(若正在自旋则继续转，只是远近变了)。 */
                     r3d_engine_set_zoom(handle, zoom);
                 } else {
-                    /* 拖拽/捏合：暂停自旋并按 orbit 设置相机 */
+                    /* 拖拽/捏合：暂停自旋，按本帧增量做四元数旋转 */
                     r3d_engine_set_autospin(handle, 0);
                     r3d_engine_orbit_delta(handle, yaw, pitch, zoom);
                 }
@@ -522,6 +590,23 @@ int main(int argc, FAR char *argv[])
                     if (idle_since_touch >= AUTOSPIN_RESUME_IDLE)
                         r3d_engine_set_autospin(handle, 1);
                 }
+            }
+
+            if (overlay) {
+                /* 装饰层每帧只需三件事：推进时钟、告知星球在屏幕上的状态、
+                 * 交给 example 排版。版式与观感都在 example 里。 */
+                clock_acc += elapsed;
+                char hms[12];
+                const char *date;
+                wf_clock_text(clock_acc, hms, sizeof(hms), &date);
+
+                wf_frame_t wff = {
+                    .scr_w    = scr_w,
+                    .scr_h    = scr_h,
+                    /* 固定场景：初始 zoom=0.90，布局半径按 1/0.90 放大。 */
+                    .sphere_r = (float)scr_h * 0.2884f,
+                };
+                wf_frame(&g_wf, &wff, hms, date);
             }
 
             ret = r3d_engine_render_frame(handle, elapsed);
@@ -567,6 +652,7 @@ int main(int argc, FAR char *argv[])
 
     printf("[%s] stopping...\n", LOG_TAG);
     touch_close(&touch);
+    wf_decor_deinit(&g_wf);
     r3d_engine_deinit();
     printf("[%s] done\n", LOG_TAG);
     return exit_code;
